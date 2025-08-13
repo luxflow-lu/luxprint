@@ -6,6 +6,15 @@ function cors(res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
+
+headers: {
+  Authorization: `Bearer ${process.env.PRINTFUL_TOKEN_EDM}`,
+  'Content-Type': 'application/json',
+  'X-PF-Store-Id': process.env.16601022   // ← ajouter
+}
+
+
+
 module.exports = async (req, res) => {
   cors(res);
   if (req.method === 'OPTIONS') return res.status(204).end();

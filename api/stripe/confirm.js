@@ -1,4 +1,9 @@
 // /api/stripe/confirm.js
+// Récupère la session Stripe -> adresse -> lit metadata (variant, placements, options, product_id) ->
+// Normalise placements/techniques avec schéma produit v2 -> ajoute options requises (stitch_color, etc.) ->
+// Crée l'ordre v2 (order_items + source:'catalog' + placements/layers + options) ->
+// Confirme l'ordre avec retry si "design/cost calculating".
+
 const { createHash } = require('crypto');
 
 function cors(res){
@@ -16,7 +21,6 @@ async function sget(path,sk){
   if(!r.ok){ const e=new Error(j?.error?.message||`Stripe GET ${path}`); e.status=r.status; e.details=j; throw e; }
   return j;
 }
-
 function pickAddr({session,pi,charge}){
   const ships=[session.shipping_details, pi?.shipping, charge?.shipping].filter(Boolean);
   const bills=[session.customer_details, charge?.billing_details].filter(Boolean);
@@ -53,18 +57,52 @@ async function pfGetProduct(productId, token, storeId){
   return j?.data || j;
 }
 
-// ---- Option safety: complète options requises via schéma produit
+// ---- Build/normalise placements & ensure required options
+function buildPlacementSpec(schema){
+  const arr = schema?.placements || schema?.available_placements || [];
+  const spec = {};
+  for (const p of arr){
+    const key = p?.key || p?.placement || p?.id || p?.name;
+    if (!key || key === 'mockup') continue;
+    const techs = Array.isArray(p?.techniques) ? p.techniques
+                : Array.isArray(p?.available_techniques) ? p.available_techniques
+                : [];
+    spec[key] = techs.map(t => String(t).toLowerCase());
+  }
+  return spec;
+}
+function normalisePlacements(incoming, spec){
+  if (!Array.isArray(incoming)) return [];
+  const keys = Object.keys(spec);
+  const out = [];
+  for (const p of incoming){
+    const url = p?.layers?.[0]?.url;
+    if (!url) continue;
+    let plc = p.placement || 'front';
+    if (!spec[plc]) plc = keys[0] || 'front';
+
+    let tech = String(p.technique || '').toLowerCase();
+    const allowed = spec[plc] || [];
+    if (allowed.length){
+      if (!allowed.includes(tech)) tech = allowed[0];
+    }
+    const item = { placement: plc, technique: tech || undefined, layers: [{ type:'file', url: String(url).replace('ucarecd.net','ucarecdn.com') }] };
+    const i = out.findIndex(x => x.placement === plc);
+    if (i >= 0) out[i] = item; else out.push(item);
+  }
+  return out;
+}
 function ensureRequiredOptions(options, productSchema, placements){
   const out = Array.isArray(options) ? [...options] : [];
   const opts = productSchema?.options || productSchema?.product_options || [];
 
-  // 1) stitch_color auto si technique embroidery détectée
+  // stitch_color si embroidery détecté
   const usesEmbroidery = Array.isArray(placements) && placements.some(p => /embro/i.test(p.technique||''));
   if (usesEmbroidery && !out.find(o => o.id === 'stitch_color')) {
     out.push({ id: 'stitch_color', value: 'black' });
   }
 
-  // 2) Pour toute option requise du schéma, si absente → 1ère valeur par défaut (quand dispo)
+  // autres options requises -> 1ère valeur par défaut
   for (const o of (opts||[])) {
     const id = o.id || o.code || o.name;
     if (!id) continue;
@@ -77,11 +115,9 @@ function ensureRequiredOptions(options, productSchema, placements){
       const first = values[0];
       out.push({ id, value: (first.value ?? first) });
     } else {
-      // fallback “vide” si pas de liste; pour stitch_color on force black
       out.push({ id, value: id==='stitch_color' ? 'black' : true });
     }
   }
-
   return out;
 }
 
@@ -122,19 +158,19 @@ module.exports=async(req,res)=>{
     // 4) external_id ≤ 32
     const external_id='cs_'+createHash('sha256').update(session.id).digest('hex').slice(0,29);
 
-    // 5) Normalise placements -> layers (URLs Uploadcare)
-    const normPlacements=(Array.isArray(placements)?placements:[]).map(p=>({
-      placement: p.placement||'front',
-      technique: p.technique||'dtg',
-      layers: (p.layers||[]).map(l=>({type:'file', url:String(l.url||'').replace('ucarecd.net','ucarecdn.com')}))
-    })).filter(p=>p.layers.length);
-
-    // 6) Sécurité Options (ajout auto des requises via schéma)
+    // 5) Schéma produit + normalisation placements/techniques
     let productSchema=null;
     if (productId) {
       try { productSchema = await pfGetProduct(productId, PF_TOKEN, PF_STORE_ID); } catch(_) {}
     }
-    const safeOptions = ensureRequiredOptions(options, productSchema, normPlacements);
+    const spec = productSchema ? buildPlacementSpec(productSchema) : {};
+    let normPlacements = normalisePlacements(placements, spec);
+    if (!normPlacements.length) {
+      return res.status(400).json({ ok:false, error:'No design layers provided' });
+    }
+
+    // 6) Options sûres (stitch_color + requises)
+    let safeOptions = ensureRequiredOptions(options, productSchema, normPlacements);
 
     // 7) Payload Printful v2
     const orderPayload={
@@ -149,16 +185,23 @@ module.exports=async(req,res)=>{
       }]
     };
 
-    // 8) Create + (optionnel) confirm
+    // 8) Create + (optionnel) confirm avec retry si coûts/design en cours
     const created=await pfCreate(orderPayload,PF_TOKEN,PF_STORE_ID);
     const oid=created?.data?.id;
     if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created});
 
     let confirmation=null;
     if(PF_CONFIRM){
-      for(let i=0;i<6;i++){
+      for(let i=0;i<12;i++){
         try{ confirmation=await pfConfirm(oid,PF_TOKEN,PF_STORE_ID); break; }
-        catch(e){ const msg=(e.details?.error?.message||'').toLowerCase(); if(e.status===409||msg.includes('calculat')){ await sleep(1500); continue; } throw e; }
+        catch(e){
+          const msg=(e.details?.error?.message||'').toLowerCase();
+          if (e.status===409 || msg.includes('calculat') || msg.includes('process')) {
+            await sleep(2000); // 2s
+            continue;
+          }
+          throw e;
+        }
       }
     }
 

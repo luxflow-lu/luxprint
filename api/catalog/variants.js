@@ -1,6 +1,6 @@
 // api/catalog/variants.js
 function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // restreins à https://luxprint.webflow.io si tu veux
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   res.setHeader('Access-Control-Max-Age', '86400');
@@ -18,26 +18,27 @@ module.exports = async (req, res) => {
     if (!token) return res.status(500).json({ error: 'Missing PRINTFUL token env var' });
 
     const url = `https://api.printful.com/v2/catalog-products/${product_id}/catalog-variants`;
-    const r = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      }
-    });
+    const r = await fetch(url, { headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' }});
     const j = await r.json().catch(() => ({}));
 
     if (!r.ok) {
       return res.status(r.status).json({ error: 'Upstream Printful error', status: r.status, details: j });
     }
 
-    // v2 renvoie { data: [ ...variants ] }
     const variantsSrc = j?.data || j?.result?.data || [];
-    const variants = variantsSrc.map(v => ({
-      variant_id: v.id || v.catalog_variant_id,
-      color: v.attributes?.color || v.color || '',
-      size:  v.attributes?.size  || v.size  || '',
-      name:  v.name || `${v.attributes?.color || ''} ${v.attributes?.size || ''}`.trim()
-    })).filter(v => v.variant_id);
+    const variants = variantsSrc.map(v => {
+      const attrs = v.attributes || {};
+      const size =
+        attrs.size || v.size || v.size_name || attrs.size_name || '';
+      const color =
+        attrs.color || v.color || v.color_name || attrs.color_name || attrs.primary_color || '';
+      return {
+        variant_id: v.id || v.catalog_variant_id,
+        size,
+        color,
+        name: v.name || `${color || ''} ${size || ''}`.trim()
+      };
+    }).filter(v => v.variant_id);
 
     return res.json({ variants });
   } catch (e) {

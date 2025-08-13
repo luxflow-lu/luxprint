@@ -15,7 +15,7 @@ module.exports = async (req, res) => {
     // Appelle l’API Catalogue Printful (v2/beta expose les options & variantes)
     const r = await fetch(`https://api.printful.com/v2/catalog-products/${product_id}`, {
       headers: {
-        Authorization: `Bearer ${process.env.PRINTFUL_TOKEN_ORDERS}`, // ou un token dédié "catalog"
+        Authorization: `Bearer ${process.env.uoTsEh1KuPzCfFIs6C2fWJvepHtMRPzFN7n5mdCY}`, // ou un token dédié "catalog"
         'Content-Type': 'application/json'
       }
     });

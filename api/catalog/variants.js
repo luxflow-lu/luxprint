@@ -1,8 +1,8 @@
 // api/catalog/variants.js
 function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*'); // tu pourras restreindre à https://luxprint.webflow.io
+  res.setHeader('Access-Control-Allow-Origin', '*'); // restreins à https://luxprint.webflow.io si tu veux
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
   res.setHeader('Access-Control-Max-Age', '86400');
 }
 
@@ -14,34 +14,29 @@ module.exports = async (req, res) => {
     const { product_id } = req.query || {};
     if (!product_id) return res.status(400).json({ error: 'Missing product_id' });
 
-    const token = process.env.PRINTFUL_TOKEN_ORDERS || process.env.PRINTFUL_TOKEN_CATALOG;
-    if (!token) return res.status(500).json({ error: 'Missing PRINTFUL_TOKEN_ORDERS (or PRINTFUL_TOKEN_CATALOG) env var' });
+    const token = process.env.PRINTFUL_TOKEN_CATALOG || process.env.PRINTFUL_TOKEN_ORDERS;
+    if (!token) return res.status(500).json({ error: 'Missing PRINTFUL token env var' });
 
-    const url = `https://api.printful.com/v2/catalog-products/${product_id}`;
+    const url = `https://api.printful.com/v2/catalog-products/${product_id}/catalog-variants`;
     const r = await fetch(url, {
       headers: {
         Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json'
-        // 'X-PF-Store-Id': process.env.PRINTFUL_STORE_ID // en général pas requis pour le catalogue
       }
     });
-
     const j = await r.json().catch(() => ({}));
+
     if (!r.ok) {
-      return res.status(r.status).json({
-        error: 'Upstream Printful error',
-        status: r.status,
-        details: j
-      });
+      return res.status(r.status).json({ error: 'Upstream Printful error', status: r.status, details: j });
     }
 
-    // Normalisation -> renvoie un tableau simple {variant_id, size, color, name}
-    const variantsSrc = j?.result?.variants || j?.result?.data?.variants || [];
+    // v2 renvoie { data: [ ...variants ] }
+    const variantsSrc = j?.data || j?.result?.data || [];
     const variants = variantsSrc.map(v => ({
-      variant_id: v.id || v.variant_id || v.catalog_variant_id,
-      size: v.size || v.size_name || v.attributes?.size || '',
-      color: v.color || v.color_name || v.attributes?.color || '',
-      name: v.name || `${v.color || ''} ${v.size || ''}`.trim()
+      variant_id: v.id || v.catalog_variant_id,
+      color: v.attributes?.color || v.color || '',
+      size:  v.attributes?.size  || v.size  || '',
+      name:  v.name || `${v.attributes?.color || ''} ${v.attributes?.size || ''}`.trim()
     })).filter(v => v.variant_id);
 
     return res.json({ variants });

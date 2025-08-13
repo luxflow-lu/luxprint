@@ -1,46 +1,67 @@
 // api/stripe/confirm.js
-// POST { session_id } -> crée/confirm la commande Printful à partir de la session Stripe
+// POST { session_id } -> récupère la session Stripe + line_items,
+// puis crée/confirm une commande Printful v2.
+//
+// Env requises (Vercel -> Settings -> Environment Variables):
+// - STRIPE_SECRET_KEY           (ex: sk_test_...)
+// - PRINTFUL_TOKEN_ORDERS       (ou PRINTFUL_TOKEN_CATALOG)
+// - PRINTFUL_STORE_ID           (optionnel ; ex: 16601022 si ton token n'est pas scoping store)
+// - PRINTFUL_CONFIRM            (optionnel ; 'false' pour créer en draft; par défaut true)
 
-function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*'); // tu peux restreindre à ton domaine Webflow
-  res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers','Content-Type');
-  res.setHeader('Access-Control-Max-Age','86400');
+const { createHash } = require('crypto');
+
+function cors(res) {
+  res.setHeader('Access-Control-Allow-Origin', '*'); // tu peux restreindre à https://luxprint.webflow.io
+  res.setHeader('Vary', 'Origin');
+  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.setHeader('Access-Control-Max-Age', '86400');
 }
 
-async function getStripeSession(sessionId, secret){
-  // Récupère la session + ses line_items
-  const sessResp = await fetch(`https://api.stripe.com/v1/checkout/sessions/${sessionId}`, {
-    headers: { 'Authorization': `Bearer ${secret}` }
-  });
-  const session = await sessResp.json();
-  if (!sessResp.ok) throw new Error(session.error?.message || 'Stripe session error');
+async function getStripeSession(sessionId, secret) {
+  const base = 'https://api.stripe.com/v1/checkout/sessions';
+  const h = { Authorization: `Bearer ${secret}` };
 
-  const itemsResp = await fetch(`https://api.stripe.com/v1/checkout/sessions/${sessionId}/line_items?limit=100`, {
-    headers: { 'Authorization': `Bearer ${secret}` }
-  });
-  const items = await itemsResp.json();
-  if (!itemsResp.ok) throw new Error(items.error?.message || 'Stripe line_items error');
+  // Session
+  const sRes = await fetch(`${base}/${sessionId}`, { headers: h });
+  const session = await sRes.json();
+  if (!sRes.ok) {
+    const msg = session?.error?.message || 'Stripe session error';
+    throw new Error(msg);
+  }
+
+  // Line items (pour qty)
+  const iRes = await fetch(`${base}/${sessionId}/line_items?limit=100`, { headers: h });
+  const items = await iRes.json();
+  if (!iRes.ok) {
+    const msg = items?.error?.message || 'Stripe line_items error';
+    throw new Error(msg);
+  }
 
   return { session, items: items.data || [] };
 }
 
-async function createPrintfulOrder(payload, token, storeId){
+async function createPrintfulOrder(payload, token, storeId) {
   const headers = {
-    'Authorization': `Bearer ${token}`,
+    Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
   };
-  if (storeId) headers['X-PF-Store-Id'] = storeId; // optionnel si ton token n’est pas “scopé” à une store
+  if (storeId) headers['X-PF-Store-Id'] = String(storeId);
 
   const resp = await fetch('https://api.printful.com/v2/orders', {
     method: 'POST',
     headers,
-    body: JSON.stringify(payload)
+    body: JSON.stringify(payload),
   });
-  const data = await resp.json().catch(()=> ({}));
+
+  const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
+    // Printful structure d'erreur: { error: { message, reason, ... }, code, result? }
     const msg = data?.error?.message || JSON.stringify(data);
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.details = data;
+    err.status = resp.status;
+    throw err;
   }
   return data;
 }
@@ -48,71 +69,94 @@ async function createPrintfulOrder(payload, token, storeId){
 module.exports = async (req, res) => {
   cors(res);
   if (req.method === 'OPTIONS') return res.status(204).end();
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
+  if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' });
 
-  try{
-    const { session_id } = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
-    if (!session_id) return res.status(400).json({ error: 'Missing session_id' });
-
+  try {
     const STRIPE_SK = process.env.STRIPE_SECRET_KEY;
-    if (!STRIPE_SK) return res.status(500).json({ error: 'Missing STRIPE_SECRET_KEY env' });
-
     const PF_TOKEN = process.env.PRINTFUL_TOKEN_ORDERS || process.env.PRINTFUL_TOKEN_CATALOG;
-    if (!PF_TOKEN) return res.status(500).json({ error: 'Missing PRINTFUL token env' });
+    const PF_STORE_ID = process.env.PRINTFUL_STORE_ID || '';
+    const PF_CONFIRM = (process.env.PRINTFUL_CONFIRM || 'true').toLowerCase() !== 'false'; // default true
 
-    const PF_STORE_ID = process.env.PRINTFUL_STORE_ID || ''; // optionnel
+    if (!STRIPE_SK) return res.status(500).json({ ok: false, error: 'Missing STRIPE_SECRET_KEY env' });
+    if (!PF_TOKEN) return res.status(500).json({ ok: false, error: 'Missing PRINTFUL token env' });
 
-    // 1) Récup Stripe
+    const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+    const session_id = body?.session_id;
+    if (!session_id) return res.status(400).json({ ok: false, error: 'Missing session_id' });
+
+    // 1) Stripe: session + items
     const { session, items } = await getStripeSession(session_id, STRIPE_SK);
 
-    // 2) Récup metadata (posées sur la session côté checkout)
+    // Assure-toi que le paiement est bien capturé
+    if (session.payment_status !== 'paid') {
+      return res.status(400).json({ ok: false, error: 'Payment not settled', payment_status: session.payment_status });
+    }
+
+    // 2) Récup metadata posées dans /api/stripe/checkout
     const m = session.metadata || {};
     const variantId = Number(m.catalog_variant_id || 0);
     const designUrl = m.design_url || '';
-    const placement  = m.placement || 'front';
-    const technique  = m.technique || 'dtg';
+    const placement = m.placement || 'front';
+    const technique = m.technique || 'dtg';
 
-    // quantité (on prend la 1ère ligne pour démarrer)
-    const qty = (items[0]?.quantity) || 1;
+    if (!variantId || !designUrl) {
+      return res.status(400).json({ ok: false, error: 'Missing required metadata (catalog_variant_id or design_url)' });
+    }
 
-    // 3) Adresse & contact
+    // 3) Quantité (on prend la 1ère ligne pour démarrer; tu pourras itérer ensuite)
+    const qty = Math.max(1, Number(items[0]?.quantity || 1));
+
+    // 4) Adresse & contact
     const ship = session.shipping_details || {};
     const addr = ship.address || {};
     const email = session.customer_details?.email || '';
+    const phone = session.customer_details?.phone || '';
+    const name = ship.name || session.customer_details?.name || 'LuxPrint Client';
 
-    // 4) Construire la commande Printful v2
+    // 5) external_id <= 32 chars (Printful)
+    // On dérive un hash court/idempotent à partir de l'id de session Stripe
+    const external_id = 'cs_' + createHash('sha256').update(session.id).digest('hex').slice(0, 29);
+
+    // 6) Payload Printful v2
     const order = {
-      external_id: session.id,     // pour faire l’upsert si besoin
-      confirm: true,               // ⚠️ confirme et lance en prod; mets false si tu veux prévisualiser d’abord
+      external_id,
+      confirm: PF_CONFIRM, // true => lance la production; false => brouillon
       recipient: {
-        name: ship.name || session.customer_details?.name || 'LuxPrint Client',
+        name,
         address1: addr.line1 || '',
         address2: addr.line2 || '',
         city: addr.city || '',
         state_code: addr.state || '',
         country_code: addr.country || '',
         zip: addr.postal_code || '',
-        phone: session.customer_details?.phone || '',
-        email
+        phone,
+        email,
       },
-      items: [{
-        catalog_variant_id: variantId,
-        quantity: qty,
-        files: [
-          { type: 'default', url: designUrl }
-        ],
-        // certaines catégories ignorent placement/technique; tu peux les retirer si besoin
-        options: [
-          { id: 'placement', value: placement },
-          { id: 'technique', value: technique }
-        ]
-      }]
+      items: [
+        {
+          catalog_variant_id: variantId,
+          quantity: qty,
+          files: [{ type: 'default', url: designUrl }],
+          // Certaines catégories ignorent ces options. Si Printful renvoie "invalid option id",
+          // commente/supprime le bloc `options` ci-dessous.
+          options: [
+            { id: 'placement', value: placement },
+            { id: 'technique', value: technique },
+          ],
+        },
+      ],
     };
 
-    // 5) Appel Printful
+    // 7) Appel Printful
     const pf = await createPrintfulOrder(order, PF_TOKEN, PF_STORE_ID);
+
     return res.status(200).json({ ok: true, printful: pf });
-  }catch(e){
-    return res.status(500).json({ ok:false, error: e.message });
+  } catch (e) {
+    const status = e.status || 500;
+    return res.status(status).json({
+      ok: false,
+      error: e.message || 'Internal error',
+      details: e.details || undefined,
+    });
   }
 };

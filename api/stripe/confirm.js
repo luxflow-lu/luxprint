@@ -9,12 +9,14 @@ function cors(res){
   res.setHeader('Access-Control-Max-Age','86400');
 }
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+
 async function sget(path,sk){
   const r=await fetch(`https://api.stripe.com/v1${path}`,{headers:{Authorization:`Bearer ${sk}`}});
   const j=await r.json();
   if(!r.ok){ const e=new Error(j?.error?.message||`Stripe GET ${path}`); e.status=r.status; e.details=j; throw e; }
   return j;
 }
+
 function pickAddr({session,pi,charge}){
   const ships=[session.shipping_details, pi?.shipping, charge?.shipping].filter(Boolean);
   const bills=[session.customer_details, charge?.billing_details].filter(Boolean);
@@ -27,6 +29,8 @@ function pickAddr({session,pi,charge}){
   if(!a.line1||!a.city||!a.country) return null;
   return { name, address1:a.line1, address2:a.line2||'', city:a.city||'', state_code:a.state||'', country_code:a.country||'', zip:a.postal_code||'', phone, email };
 }
+
+// ---- Printful helpers (v2)
 function pfHeaders(token,storeId){
   const h={Authorization:`Bearer ${token}`,'Content-Type':'application/json'}; if(storeId) h['X-PF-Store-Id']=String(storeId); return h;
 }
@@ -42,11 +46,50 @@ async function pfConfirm(id,token,storeId){
   if(!r.ok){ const e=new Error(j?.error?.message||JSON.stringify(j)); e.status=r.status; e.details=j; throw e; }
   return j;
 }
+async function pfGetProduct(productId, token, storeId){
+  const r=await fetch(`https://api.printful.com/v2/catalog-products/${productId}`,{headers:pfHeaders(token,storeId)});
+  const j=await r.json().catch(()=> ({}));
+  if(!r.ok){ const e=new Error(j?.error?.message||JSON.stringify(j)); e.status=r.status; e.details=j; throw e; }
+  return j?.data || j;
+}
+
+// ---- Option safety: complète options requises via schéma produit
+function ensureRequiredOptions(options, productSchema, placements){
+  const out = Array.isArray(options) ? [...options] : [];
+  const opts = productSchema?.options || productSchema?.product_options || [];
+
+  // 1) stitch_color auto si technique embroidery détectée
+  const usesEmbroidery = Array.isArray(placements) && placements.some(p => /embro/i.test(p.technique||''));
+  if (usesEmbroidery && !out.find(o => o.id === 'stitch_color')) {
+    out.push({ id: 'stitch_color', value: 'black' });
+  }
+
+  // 2) Pour toute option requise du schéma, si absente → 1ère valeur par défaut (quand dispo)
+  for (const o of (opts||[])) {
+    const id = o.id || o.code || o.name;
+    if (!id) continue;
+    const isReq = !!(o.required || o.is_required);
+    if (!isReq) continue;
+    if (out.find(x => x.id === id)) continue;
+
+    const values = o.values || o.allowed_values || [];
+    if (Array.isArray(values) && values.length) {
+      const first = values[0];
+      out.push({ id, value: (first.value ?? first) });
+    } else {
+      // fallback “vide” si pas de liste; pour stitch_color on force black
+      out.push({ id, value: id==='stitch_color' ? 'black' : true });
+    }
+  }
+
+  return out;
+}
 
 module.exports=async(req,res)=>{
   cors(res);
   if(req.method==='OPTIONS') return res.status(204).end();
   if(req.method!=='POST') return res.status(405).json({ok:false,error:'Method not allowed'});
+
   try{
     const SK=process.env.STRIPE_SECRET_KEY;
     const PF_TOKEN=process.env.PRINTFUL_TOKEN_ORDERS||process.env.PRINTFUL_TOKEN_CATALOG;
@@ -58,44 +101,55 @@ module.exports=async(req,res)=>{
     const {session_id}=typeof req.body==='string'?JSON.parse(req.body):(req.body||{});
     if(!session_id) return res.status(400).json({ok:false,error:'Missing session_id'});
 
+    // 1) Stripe
     const session=await sget(`/checkout/sessions/${session_id}`,SK);
     const pi=session.payment_intent?await sget(`/payment_intents/${session.payment_intent}?expand[]=latest_charge`,SK):null;
     const charge=pi?.latest_charge||(pi?.charges?.data?.[0]||null);
     if(session.payment_status!=='paid') return res.status(400).json({ok:false,error:'Payment not settled',payment_status:session.payment_status});
 
-    // Metadata -> produit
+    // 2) Metadata
     const m=session.metadata||{};
     const variantId=Number(m.catalog_variant_id||0);
+    const productId=Number(m.product_id||0);
     let placements=[]; try{ placements=JSON.parse(m.placements_json||'[]'); }catch(_){}
-    let options=[];    try{ options=JSON.parse(m.options_json||'[]'); }catch(_){}
+    let options=[];    try{ options   =JSON.parse(m.options_json   ||'[]'); }catch(_){}
     if(!variantId) return res.status(400).json({ok:false,error:'Missing catalog_variant_id metadata'});
 
-    // Adresse
+    // 3) Adresse
     const recipient=pickAddr({session,pi,charge});
     if(!recipient) return res.status(400).json({ok:false,error:'Missing or incomplete recipient address'});
 
-    // external_id <= 32
+    // 4) external_id ≤ 32
     const external_id='cs_'+createHash('sha256').update(session.id).digest('hex').slice(0,29);
 
-    // Normalise placements -> layers
+    // 5) Normalise placements -> layers (URLs Uploadcare)
     const normPlacements=(Array.isArray(placements)?placements:[]).map(p=>({
       placement: p.placement||'front',
       technique: p.technique||'dtg',
       layers: (p.layers||[]).map(l=>({type:'file', url:String(l.url||'').replace('ucarecd.net','ucarecdn.com')}))
     })).filter(p=>p.layers.length);
 
+    // 6) Sécurité Options (ajout auto des requises via schéma)
+    let productSchema=null;
+    if (productId) {
+      try { productSchema = await pfGetProduct(productId, PF_TOKEN, PF_STORE_ID); } catch(_) {}
+    }
+    const safeOptions = ensureRequiredOptions(options, productSchema, normPlacements);
+
+    // 7) Payload Printful v2
     const orderPayload={
       external_id,
       recipient,
       order_items:[{
         catalog_variant_id: variantId,
         source:'catalog',
-        quantity: 1,
-        options: (options||[]).map(o=>({id:o.id, value:o.value})),
+        quantity:1,
+        options: safeOptions.map(o=>({id:o.id, value:o.value})),
         placements: normPlacements
       }]
     };
 
+    // 8) Create + (optionnel) confirm
     const created=await pfCreate(orderPayload,PF_TOKEN,PF_STORE_ID);
     const oid=created?.data?.id;
     if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created});
@@ -107,6 +161,9 @@ module.exports=async(req,res)=>{
         catch(e){ const msg=(e.details?.error?.message||'').toLowerCase(); if(e.status===409||msg.includes('calculat')){ await sleep(1500); continue; } throw e; }
       }
     }
+
     res.status(200).json({ok:true, printful:{created,confirmation}});
-  }catch(e){ res.status(e.status||500).json({ok:false,error:e.message,details:e.details}); }
+  }catch(e){
+    res.status(e.status||500).json({ok:false,error:e.message,details:e.details});
+  }
 };

@@ -1,12 +1,12 @@
 // /api/stripe/confirm.js
-// Stripe -> metadata(cart_json) -> récupère schéma produit (via product_id OU via variant_id)
-// -> normalise placements/techniques -> ajoute TOUTES les options "stitch/seam/thread color" nécessaires
-// -> crée + confirme la commande Printful v2 (avec retry & fallback)
+// Stripe -> recup metadata -> charge schéma produit (via product_id OU via variant_id)
+// -> normalise placements/techniques -> AJOUTE product_options (name/value) dont stitch/seam/thread color
+// -> crée + confirme l'ordre Printful v2
 
 const { createHash } = require('crypto');
 
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*'); // restreins à ton domaine en prod
+  res.setHeader('Access-Control-Allow-Origin','*'); // restreins en prod
   res.setHeader('Vary','Origin');
   res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Requested-With');
@@ -71,7 +71,7 @@ function deriveTechsFromKey(key){
   if (/_dtf$/.test(k) || k.includes('dtf')) return ['dtfilm'];                     // DTF
   if (k.includes('embroider')) return ['embroidery'];                              // Broderie
   if (k.includes('all-over') || k.includes('sublim')) return ['sublimation'];     // AOP
-  return ['dtfilm','dtg'];                                                         // favorise dtfilm si doute
+  return ['dtfilm','dtg'];
 }
 function buildPlacementSpec(schema){
   const arr = schema?.placements || schema?.available_placements || [];
@@ -112,18 +112,18 @@ function normalisePlacements(incoming, spec){
   return out;
 }
 
-// ---------- Options (détection large des couleurs de couture)
+// ---------- Options (v2 = product_options avec {name, value})
 function collectAllOptions(schema){
   if (!schema) return [];
   const keys = Object.keys(schema).filter(k => /option/i.test(k)); // options, product_options, available_options, etc.
   const arrs = keys.map(k => Array.isArray(schema[k]) ? schema[k] : []).flat();
-  // normalise
   return arrs.map(o => ({
     id: (o.id||o.code||o.name||'').toString(),
     title: (o.title||'').toString(),
     values: Array.isArray(o.values) ? o.values
           : Array.isArray(o.allowed_values) ? o.allowed_values
-          : []
+          : [],
+    required: !!(o.required || o.is_required)
   })).filter(o => o.id || o.title);
 }
 function findStitchLikeOptionIds(schema){
@@ -135,7 +135,6 @@ function findStitchLikeOptionIds(schema){
       ids.push(o.id);
     }
   }
-  // si 'stitch_color' existe, le placer en tête
   ids.sort((a,b)=> (a==='stitch_color'? -1 : b==='stitch_color'? 1 : 0));
   return Array.from(new Set(ids));
 }
@@ -148,38 +147,38 @@ function pickValueForOptionId(schema, id){
     if (vBlack) return (vBlack.value||vBlack);
     return (values[0].value||values[0]);
   }
-  // fallback sans liste
   return 'black';
 }
-function ensureOptions(options, productSchema, placements){
-  const out = Array.isArray(options) ? [...options] : [];
+function ensureProductOptions(incomingOptions, productSchema, placements){
+  // transforme vers [{name,value}]
+  const out = Array.isArray(incomingOptions)
+    ? incomingOptions.map(o => ({ name: o.name || o.id, value: o.value }))
+    : [];
 
-  // Déterminer si le produit/technique rend la couture "nécessaire"
+  // besoin couture si embroidery / AOP
   const needsByTechnique = Array.isArray(placements) && placements.some(p =>
     /embro|sublim|all[-_\s]?over|cut|sew|aop/i.test(p.technique||'')
   );
 
-  // 1) Ajoute toutes les options couture connues du schéma (stitch/seam/thread color)
+  // 1) ajouter toutes les options “stitch/seam/thread color” connues du schéma
   const stitchIds = findStitchLikeOptionIds(productSchema);
   for (const id of stitchIds){
-    if (!out.find(o => o.id === id)) {
-      out.push({ id, value: pickValueForOptionId(productSchema, id) });
+    if (!out.find(o => o.name === id)) {
+      out.push({ name:id, value: pickValueForOptionId(productSchema, id) });
     }
   }
-
-  // 2) Si aucune option couture trouvée dans le schéma mais contexte AOP/broderie, ajoute 'stitch_color'
-  if (needsByTechnique && !out.find(o => o.id==='stitch_color')) {
-    out.push({ id:'stitch_color', value:'black' });
+  // 2) si aucune trouvée mais contexte AOP/broderie -> stitch_color noir
+  if (needsByTechnique && !out.find(o => /stitch|seam|thread/i.test(String(o.name)) && /color/i.test(String(o.name)))){
+    out.push({ name:'stitch_color', value:'black' });
   }
 
-  // 3) Autres options "required" -> 1ʳᵉ valeur par défaut si absentes
+  // 3) options "required" manquantes -> 1ʳᵉ valeur par défaut
   const all = collectAllOptions(productSchema);
   for (const o of all){
-    const isReq = !!(o.required || o.is_required);
-    if (!isReq) continue;
-    if (out.find(x => x.id === o.id)) continue;
+    if (!o.required) continue;
+    if (out.find(x => x.name === o.id)) continue;
     const first = Array.isArray(o.values) && o.values.length ? (o.values[0].value||o.values[0]) : true;
-    out.push({ id:o.id, value:first });
+    out.push({ name:o.id, value:first });
   }
 
   return out;
@@ -214,10 +213,10 @@ module.exports = async (req, res) => {
     let cart=[]; try{ cart=JSON.parse(m.cart_json||'[]'); }catch(_){}
     if(!Array.isArray(cart) || !cart.length) return res.status(400).json({ok:false,error:'Missing cart metadata'});
 
-    const item = cart[0];
+    const item = cart[0]; // mono-produit
     const variantId = Number(item?.variant_id || 0);
     let placements = item?.placements || [];
-    let options    = item?.options    || [];
+    let options    = item?.options    || []; // pourra être vide
     if(!variantId) return res.status(400).json({ok:false,error:'Missing catalog_variant_id'});
 
     // 3) Adresse
@@ -227,7 +226,7 @@ module.exports = async (req, res) => {
     // 4) external_id ≤ 32
     const external_id='cs_'+createHash('sha256').update(session.id).digest('hex').slice(0,29);
 
-    // 5) Schéma produit (via product_id, sinon via variant -> product)
+    // 5) Schéma produit
     let productSchema=null;
     let productId = productIdMeta;
     try {
@@ -245,8 +244,8 @@ module.exports = async (req, res) => {
     const normPlacements = normalisePlacements(placements, spec);
     if (!normPlacements.length) return res.status(400).json({ ok:false, error:'No design layers provided' });
 
-    // 7) Options (ajoute toutes les variantes stitch/seam/thread color pertinentes)
-    let safeOptions = ensureOptions(options, productSchema, normPlacements);
+    // 7) -> **product_options** (et non "options"), au format {name,value}
+    let product_options = ensureProductOptions(options, productSchema, normPlacements);
 
     // 8) Payload Printful v2
     let orderPayload = {
@@ -256,22 +255,22 @@ module.exports = async (req, res) => {
         catalog_variant_id: variantId,
         source: 'catalog',
         quantity: 1,
-        options: safeOptions.map(o => ({ id:o.id, value:o.value })),
-        placements: normPlacements
+        product_options,            // ✅ v2: product_options
+        placements: normPlacements  // techniques & layers
       }]
     };
 
-    // 9) Create + confirm (retry si design/cost en cours).
-    //    Fallback spécial : si Printful répond "stitch_color missing", on retente en ajoutant explicitement {id:'stitch_color', value:'black'}.
+    // 9) Create + confirm (retry pour coûts/mockup)
     let created;
     try{
       created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
     }catch(e1){
+      // Fallback ultime: si un message "stitch_color missing" ressort encore, on force explicitement.
       const msg = (e1.details?.error?.message || e1.message || '').toLowerCase();
-      if (msg.includes('stitch_color') && msg.includes('missing') && !safeOptions.find(o=>o.id==='stitch_color')) {
-        safeOptions = [...safeOptions, { id:'stitch_color', value:'black' }];
-        orderPayload.order_items[0].options = safeOptions.map(o=>({id:o.id, value:o.value}));
-        created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID); // second essai
+      if (msg.includes('stitch_color') && msg.includes('missing') && !product_options.find(o=>o.name==='stitch_color')) {
+        product_options = [...product_options, { name:'stitch_color', value:'black' }];
+        orderPayload.order_items[0].product_options = product_options;
+        created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
       } else {
         throw e1;
       }

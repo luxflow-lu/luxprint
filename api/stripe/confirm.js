@@ -95,11 +95,8 @@ function deriveTechsFromKey(key){
   if (/\ball[-_\s]?over\b/.test(k) || /\bcut[-_\s]?&?[-_\s]?sew\b/.test(k) || /\bsublim/.test(k)) return ['cut-sew'];
   if (/_dtf$/.test(k) || /\bdtf\b/.test(k)) return ['dtfilm'];
   if (/\bembroider/.test(k)) return ['embroidery'];
-  // fallback textile: essaiera dtg avant dtfilm quand on corrige
   return ['dtg','dtfilm'];
 }
-// ... haut du fichier identique à ta version en place ...
-
 function normalisePlacements(incoming, spec){
   if (!Array.isArray(incoming)) return [];
   const keys = Object.keys(spec||{});
@@ -129,9 +126,7 @@ function normalisePlacements(incoming, spec){
   return out;
 }
 
-// ... le reste (ensureProductOptions, fillMissingPlacements, handler, etc.) inchangé ...
-
-// ---- options produit (booléens, valeurs autorisées, couture auto, lifelike masquée si non requise)
+// options produit (booléens, valeurs autorisées, lifelike masquée si non requise, couture auto)
 function coerceBoolean(v){
   if (v === true || v === false) return v;
   const s = String(v).toLowerCase();
@@ -148,7 +143,6 @@ function pickFirstValue(opt){
 }
 function ensureProductOptions(incoming, schema, placements){
   const all = collectAllOptions(schema);
-
   let out = Array.isArray(incoming)
     ? incoming.map(o => {
         const name = (o.name || o.id);
@@ -168,11 +162,9 @@ function ensureProductOptions(incoming, schema, placements){
   const has = n => out.find(x => String(x.name) === String(n));
   const get = n => all.find(x => x.id === n);
 
-  // lifelike : supprimer si non requis
   const likeDef = get('lifelike');
   if (likeDef && !likeDef.required) out = out.filter(x => x.name !== 'lifelike');
 
-  // ajouter les REQUIRED manquantes
   for (const opt of all){
     if (!opt.required) continue;
     if (has(opt.id)) continue;
@@ -183,10 +175,8 @@ function ensureProductOptions(incoming, schema, placements){
     out.push({ name: opt.id, value: defVal });
   }
 
-  // couture si technique embroidery/cut-sew et aucune couleur de couture fournie
   const needStitch = Array.isArray(placements) && placements.some(p => /embro|cut[-_\s]?sew/i.test(p.technique||''));
   if (needStitch && !out.find(o => /stitch|seam|thread/i.test(String(o.name)) && /color/i.test(String(o.name)))){
-    // si schéma contient une couleur de couture -> 1ère valeur, sinon 'black'
     const stitchOpt = all.find(o => /color/i.test(o.title||'') && /(stitch|seam|thread)/i.test(o.title||''));
     if (stitchOpt && Array.isArray(stitchOpt.values) && stitchOpt.values.length){
       out.push({ name: stitchOpt.id, value: (stitchOpt.values[0].value||stitchOpt.values[0]) });
@@ -195,15 +185,13 @@ function ensureProductOptions(incoming, schema, placements){
     }
   }
 
-  // dédup
   const map = new Map();
   for (const o of out) map.set(String(o.name), o.value);
   return Array.from(map, ([name,value]) => ({ name, value }));
 }
 
-// ---- Fallbacks intelligents en cas d'erreurs Printful
+// fallbacks placements
 function fillMissingPlacements(placements, spec){
-  // duplique le 1er visuel sur TOUTES les clés dispo si certaines manquent
   if (!placements.length) return placements;
   const firstLayer = placements[0]?.layers?.[0];
   if (!firstLayer?.url) return placements;
@@ -218,14 +206,13 @@ function fillMissingPlacements(placements, spec){
       out.push({
         placement: key,
         technique: (techs[0]||'dtg'),
-        layers: [{ type:'file', url: firstLayer.url }]
+        layers: [{ type:'file', url: firstLayer.url, filename: firstLayer.filename || 'design.png' }]
       });
     }
   }
   return out;
 }
 function forceAllowedTechniqueForPlacement(placements, spec){
-  // si une technique n’est pas autorisée pour un placement, remplace-la par la 1ʳᵉ autorisée
   return placements.map(p=>{
     const allowed = (spec && spec[p.placement]) || deriveTechsFromKey(p.placement);
     const tech = String(p.technique||'').toLowerCase();
@@ -251,13 +238,11 @@ module.exports = async (req, res) => {
     const {session_id}=typeof req.body==='string'?JSON.parse(req.body):(req.body||{});
     if(!session_id) return res.status(400).json({ok:false,error:'Missing session_id'});
 
-    // Stripe
     const session=await sget(`/checkout/sessions/${session_id}`,SK);
     if(session.payment_status!=='paid') return res.status(400).json({ok:false,error:'Payment not settled',payment_status:session.payment_status});
     const pi=session.payment_intent?await sget(`/payment_intents/${session.payment_intent}?expand[]=latest_charge`,SK):null;
     const charge=pi?.latest_charge||(pi?.charges?.data?.[0]||null);
 
-    // Metadata cart
     const m = session.metadata || {};
     const productIdMeta = Number(m.product_id || 0);
     let cart=[]; try{ cart=JSON.parse(m.cart_json||'[]'); }catch(_){}
@@ -265,18 +250,16 @@ module.exports = async (req, res) => {
 
     const item = cart[0]; // mono-produit
     const variantId = Number(item?.variant_id || 0);
+    const quantity  = Math.max(1, parseInt(item?.quantity || 1, 10));
     let placements = item?.placements || [];
     let options    = item?.options    || [];
     if(!variantId) return res.status(400).json({ok:false,error:'Missing catalog_variant_id'});
 
-    // Adresse
     const recipient = pickAddr({session,pi,charge});
     if(!recipient) return res.status(400).json({ok:false,error:'Missing or incomplete recipient address'});
 
-    // external_id ≤ 32
     const external_id='cs_'+createHash('sha256').update(session.id).digest('hex').slice(0,29);
 
-    // Schéma produit
     let productSchema=null;
     let productId = productIdMeta;
     try {
@@ -301,20 +284,19 @@ module.exports = async (req, res) => {
       order_items: [{
         catalog_variant_id: variantId,
         source: 'catalog',
-        quantity: 1,
+        quantity: quantity,                              // ✅ quantité côté Printful
         product_options,
         placements: normPlacements
       }]
     };
 
-    // ----- Create + fallbacks automatiques
+    // Create + fallbacks
     let created;
     try{
       created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
     }catch(e1){
       const msg = (e1.details?.error?.message || e1.message || '').toLowerCase();
 
-      // 1) Placement X cannot be used with Y technique → force technique autorisée pour ce placement
       const mPlcTech = msg.match(/placement\s*`?([a-z0-9_\-]+)`?\s*cannot be used with\s*`?([a-z0-9_\-]+)`?\s*technique/i);
       if (mPlcTech){
         const badPlc = mPlcTech[1];
@@ -327,26 +309,21 @@ module.exports = async (req, res) => {
         });
         created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
       }
+      else if (/must use additional placements|available placements are/i.test(msg)){
+        orderPayload.order_items[0].placements = fillMissingPlacements(orderPayload.order_items[0].placements, spec);
+        orderPayload.order_items[0].placements = forceAllowedTechniqueForPlacement(orderPayload.order_items[0].placements, spec);
+        created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
+      }
       else {
-        // 2) Must use additional placements ... available placements are ...
-        const mAddPlc = msg.match(/must use additional placements|available placements are/i);
-        if (mAddPlc){
-          orderPayload.order_items[0].placements = fillMissingPlacements(orderPayload.order_items[0].placements, spec);
-          orderPayload.order_items[0].placements = forceAllowedTechniqueForPlacement(orderPayload.order_items[0].placements, spec);
-          created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
-        }
-        else {
-          // 3) Invalid technique used: `x` one of: [a,b] → déjà géré précédemment, mais on garde le fallback
-          const mTech = msg.match(/invalid technique used:\s*`?([a-z\-]+)`?.*?\[(.*?)\]/i);
-          if (mTech) {
-            const allowed = mTech[2].split(',').map(s=>s.trim().replace(/[\s'"]/g,'')).filter(Boolean);
-            if (allowed.length){
-              orderPayload.order_items[0].placements = orderPayload.order_items[0].placements.map(p=> ({ ...p, technique: allowed[0] }));
-              created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
-            } else throw e1;
-          } else {
-            throw e1;
-          }
+        const mTech = msg.match(/invalid technique used:\s*`?([a-z\-]+)`?.*?\[(.*?)\]/i);
+        if (mTech) {
+          const allowed = mTech[2].split(',').map(s=>s.trim().replace(/[\s'"]/g,'')).filter(Boolean);
+          if (allowed.length){
+            orderPayload.order_items[0].placements = orderPayload.order_items[0].placements.map(p=> ({ ...p, technique: allowed[0] }));
+            created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
+          } else throw e1;
+        } else {
+          throw e1;
         }
       }
     }
@@ -354,7 +331,7 @@ module.exports = async (req, res) => {
     const oid = created?.data?.id;
     if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created});
 
-    // Confirm (retry si calcul/process)
+    // Confirm avec retry
     let confirmation=null;
     if(PF_CONFIRM){
       for(let i=0;i<12;i++){

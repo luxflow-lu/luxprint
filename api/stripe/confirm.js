@@ -2,7 +2,7 @@
 const { createHash } = require('crypto');
 
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*'); // limite à ton domaine en prod
+  res.setHeader('Access-Control-Allow-Origin','*'); // en prod: restreins à ton domaine
   res.setHeader('Vary','Origin');
   res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Requested-With');
@@ -61,7 +61,7 @@ async function pfGetVariant(variantId, token, storeId){
   return j?.data || j;
 }
 
-// ---------- Utilitaires schéma / placements / options
+// ---------- Schéma / placements / options
 function collectAllOptions(schema){
   if (!schema) return [];
   const keys = Object.keys(schema || {}).filter(k => /option/i.test(k));
@@ -95,7 +95,8 @@ function deriveTechsFromKey(key){
   if (/\ball[-_\s]?over\b/.test(k) || /\bcut[-_\s]?&?[-_\s]?sew\b/.test(k) || /\bsublim/.test(k)) return ['cut-sew'];
   if (/_dtf$/.test(k) || /\bdtf\b/.test(k)) return ['dtfilm'];
   if (/\bembroider/.test(k)) return ['embroidery'];
-  return ['dtfilm','dtg'];
+  // fallback textile: essaiera dtg avant dtfilm quand on corrige
+  return ['dtg','dtfilm'];
 }
 function normalisePlacements(incoming, spec){
   if (!Array.isArray(incoming)) return [];
@@ -106,7 +107,7 @@ function normalisePlacements(incoming, spec){
     if (!url) continue;
 
     let plc = p.placement || 'front';
-    if (!spec[plc]) plc = keys[0] || 'front';
+    if (!spec[plc] && keys.length) plc = keys[0]; // mappe vers 1er placement valide
 
     let tech = String(p.technique || '').toLowerCase();
     const allowed = spec[plc] || deriveTechsFromKey(plc).map(x=>String(x).toLowerCase());
@@ -119,6 +120,7 @@ function normalisePlacements(incoming, spec){
   return out;
 }
 
+// ---- options produit (booléens, valeurs autorisées, couture auto, lifelike masquée si non requise)
 function coerceBoolean(v){
   if (v === true || v === false) return v;
   const s = String(v).toLowerCase();
@@ -133,20 +135,15 @@ function pickFirstValue(opt){
   }
   return true;
 }
-
-// ✅ options robustes : booléens, valeurs autorisées, lifelike supprimée si non requise, couture auto
 function ensureProductOptions(incoming, schema, placements){
   const all = collectAllOptions(schema);
 
-  // map front -> [{name,value}] + coercion + validation
   let out = Array.isArray(incoming)
     ? incoming.map(o => {
         const name = (o.name || o.id);
         const def  = all.find(x => x.id === name);
         let value  = o.value;
-
         if (def?.type === 'boolean') value = coerceBoolean(value);
-
         if (Array.isArray(def?.values) && def.values.length){
           const allowed = def.values.map(v => v.value ?? v);
           if (!allowed.some(av => String(av) === String(value))) {
@@ -160,29 +157,25 @@ function ensureProductOptions(incoming, schema, placements){
   const has = n => out.find(x => String(x.name) === String(n));
   const get = n => all.find(x => x.id === n);
 
-  // lifelike : enlever si non requis
+  // lifelike : supprimer si non requis
   const likeDef = get('lifelike');
-  if (likeDef && !likeDef.required) {
-    out = out.filter(x => x.name !== 'lifelike');
-  }
+  if (likeDef && !likeDef.required) out = out.filter(x => x.name !== 'lifelike');
 
-  // ajouter toutes les REQUIRED manquantes (bool=false par défaut)
+  // ajouter les REQUIRED manquantes
   for (const opt of all){
     if (!opt.required) continue;
     if (has(opt.id)) continue;
-
     let defVal;
     if (opt.type === 'boolean') defVal = false;
     else if (Array.isArray(opt.values) && opt.values.length) defVal = (opt.values[0].value||opt.values[0]);
     else defVal = pickFirstValue(opt);
-
     out.push({ name: opt.id, value: defVal });
   }
 
-  // couture (stitch/seam/thread color) si technique embroidery/cut-sew
-  const needsByTechnique = Array.isArray(placements) && placements.some(p => /embro|cut[-_\s]?sew/i.test(p.technique||''));
-  if (needsByTechnique && !out.find(o => /stitch|seam|thread/i.test(String(o.name)) && /color/i.test(String(o.name)))){
-    // si le schéma contient une option couleur de couture, prends sa 1ʳᵉ valeur, sinon noir
+  // couture si technique embroidery/cut-sew et aucune couleur de couture fournie
+  const needStitch = Array.isArray(placements) && placements.some(p => /embro|cut[-_\s]?sew/i.test(p.technique||''));
+  if (needStitch && !out.find(o => /stitch|seam|thread/i.test(String(o.name)) && /color/i.test(String(o.name)))){
+    // si schéma contient une couleur de couture -> 1ère valeur, sinon 'black'
     const stitchOpt = all.find(o => /color/i.test(o.title||'') && /(stitch|seam|thread)/i.test(o.title||''));
     if (stitchOpt && Array.isArray(stitchOpt.values) && stitchOpt.values.length){
       out.push({ name: stitchOpt.id, value: (stitchOpt.values[0].value||stitchOpt.values[0]) });
@@ -191,10 +184,43 @@ function ensureProductOptions(incoming, schema, placements){
     }
   }
 
-  // déduplication (le dernier gagne)
+  // dédup
   const map = new Map();
   for (const o of out) map.set(String(o.name), o.value);
   return Array.from(map, ([name,value]) => ({ name, value }));
+}
+
+// ---- Fallbacks intelligents en cas d'erreurs Printful
+function fillMissingPlacements(placements, spec){
+  // duplique le 1er visuel sur TOUTES les clés dispo si certaines manquent
+  if (!placements.length) return placements;
+  const firstLayer = placements[0]?.layers?.[0];
+  if (!firstLayer?.url) return placements;
+
+  const keys = Object.keys(spec||{});
+  if (!keys.length) return placements;
+
+  const out = [...placements];
+  for (const key of keys){
+    if (!out.find(p => p.placement === key)){
+      const techs = spec[key] || deriveTechsFromKey(key);
+      out.push({
+        placement: key,
+        technique: (techs[0]||'dtg'),
+        layers: [{ type:'file', url: firstLayer.url }]
+      });
+    }
+  }
+  return out;
+}
+function forceAllowedTechniqueForPlacement(placements, spec){
+  // si une technique n’est pas autorisée pour un placement, remplace-la par la 1ʳᵉ autorisée
+  return placements.map(p=>{
+    const allowed = (spec && spec[p.placement]) || deriveTechsFromKey(p.placement);
+    const tech = String(p.technique||'').toLowerCase();
+    if (!allowed.includes(tech)) return { ...p, technique: allowed[0] };
+    return p;
+  });
 }
 
 // ---------- Handler
@@ -214,27 +240,32 @@ module.exports = async (req, res) => {
     const {session_id}=typeof req.body==='string'?JSON.parse(req.body):(req.body||{});
     if(!session_id) return res.status(400).json({ok:false,error:'Missing session_id'});
 
+    // Stripe
     const session=await sget(`/checkout/sessions/${session_id}`,SK);
     if(session.payment_status!=='paid') return res.status(400).json({ok:false,error:'Payment not settled',payment_status:session.payment_status});
     const pi=session.payment_intent?await sget(`/payment_intents/${session.payment_intent}?expand[]=latest_charge`,SK):null;
     const charge=pi?.latest_charge||(pi?.charges?.data?.[0]||null);
 
+    // Metadata cart
     const m = session.metadata || {};
     const productIdMeta = Number(m.product_id || 0);
     let cart=[]; try{ cart=JSON.parse(m.cart_json||'[]'); }catch(_){}
     if(!Array.isArray(cart) || !cart.length) return res.status(400).json({ok:false,error:'Missing cart metadata'});
 
-    const item = cart[0];
+    const item = cart[0]; // mono-produit
     const variantId = Number(item?.variant_id || 0);
     let placements = item?.placements || [];
     let options    = item?.options    || [];
     if(!variantId) return res.status(400).json({ok:false,error:'Missing catalog_variant_id'});
 
+    // Adresse
     const recipient = pickAddr({session,pi,charge});
     if(!recipient) return res.status(400).json({ok:false,error:'Missing or incomplete recipient address'});
 
+    // external_id ≤ 32
     const external_id='cs_'+createHash('sha256').update(session.id).digest('hex').slice(0,29);
 
+    // Schéma produit
     let productSchema=null;
     let productId = productIdMeta;
     try {
@@ -265,27 +296,54 @@ module.exports = async (req, res) => {
       }]
     };
 
+    // ----- Create + fallbacks automatiques
     let created;
     try{
       created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
     }catch(e1){
       const msg = (e1.details?.error?.message || e1.message || '').toLowerCase();
-      const mTech = msg.match(/invalid technique used:\s*`?([a-z\-]+)`?.*?\[(.*?)\]/i);
-      if (mTech) {
-        const allowed = mTech[2].split(',').map(s=>s.trim().replace(/[\s'"]/g,'')).filter(Boolean);
-        if (allowed.length){
-          normPlacements = normPlacements.map(p => ({ ...p, technique: allowed[0] }));
-          orderPayload.order_items[0].placements = normPlacements;
+
+      // 1) Placement X cannot be used with Y technique → force technique autorisée pour ce placement
+      const mPlcTech = msg.match(/placement\s*`?([a-z0-9_\-]+)`?\s*cannot be used with\s*`?([a-z0-9_\-]+)`?\s*technique/i);
+      if (mPlcTech){
+        const badPlc = mPlcTech[1];
+        const allowed = (spec && spec[badPlc]) || deriveTechsFromKey(badPlc);
+        orderPayload.order_items[0].placements = orderPayload.order_items[0].placements.map(p=>{
+          if (p.placement === badPlc){
+            return { ...p, technique: allowed[0] || 'dtg' };
+          }
+          return p;
+        });
+        created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
+      }
+      else {
+        // 2) Must use additional placements ... available placements are ...
+        const mAddPlc = msg.match(/must use additional placements|available placements are/i);
+        if (mAddPlc){
+          orderPayload.order_items[0].placements = fillMissingPlacements(orderPayload.order_items[0].placements, spec);
+          orderPayload.order_items[0].placements = forceAllowedTechniqueForPlacement(orderPayload.order_items[0].placements, spec);
           created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
-        } else throw e1;
-      } else {
-        throw e1;
+        }
+        else {
+          // 3) Invalid technique used: `x` one of: [a,b] → déjà géré précédemment, mais on garde le fallback
+          const mTech = msg.match(/invalid technique used:\s*`?([a-z\-]+)`?.*?\[(.*?)\]/i);
+          if (mTech) {
+            const allowed = mTech[2].split(',').map(s=>s.trim().replace(/[\s'"]/g,'')).filter(Boolean);
+            if (allowed.length){
+              orderPayload.order_items[0].placements = orderPayload.order_items[0].placements.map(p=> ({ ...p, technique: allowed[0] }));
+              created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
+            } else throw e1;
+          } else {
+            throw e1;
+          }
+        }
       }
     }
 
     const oid = created?.data?.id;
     if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created});
 
+    // Confirm (retry si calcul/process)
     let confirmation=null;
     if(PF_CONFIRM){
       for(let i=0;i<12;i++){

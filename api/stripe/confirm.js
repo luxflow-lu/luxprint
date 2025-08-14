@@ -1,8 +1,10 @@
 // /api/stripe/confirm.js
+// Stripe -> metadata -> normalisation placements/techniques via schéma v2 -> options (stitch_color toujours si dispo) -> create + confirm (retry)
+
 const { createHash } = require('crypto');
 
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*');   // serre ensuite à ton domaine
+  res.setHeader('Access-Control-Allow-Origin','*');   // restreins à ton domaine en prod
   res.setHeader('Vary','Origin');
   res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Requested-With');
@@ -53,12 +55,13 @@ async function pfGetProduct(productId, token, storeId){
   return j?.data || j;
 }
 
-// ---- Normalisation placements/techniques + options requises
+// ---- Normalisation placements/techniques + options
 function deriveTechsFromKey(key){
   const k=String(key||'').toLowerCase();
-  if (/_dtf$/.test(k) || k.includes('dtf')) return ['dtfilm'];   // DTF
-  if (k.includes('embroider')) return ['embroidery'];            // broderie
-  return ['dtfilm','dtg'];                                       // ordre: favorise dtfilm si doute
+  if (/_dtf$/.test(k) || k.includes('dtf')) return ['dtfilm'];     // DTF
+  if (k.includes('embroider')) return ['embroidery'];              // broderie
+  if (k.includes('all-over') || k.includes('sublim')) return ['sublimation']; // AOP
+  return ['dtfilm','dtg'];                                         // favorise dtfilm si doute
 }
 function buildPlacementSpec(schema){
   const arr = schema?.placements || schema?.available_placements || [];
@@ -88,9 +91,8 @@ function normalisePlacements(incoming, spec){
     let tech = String(p.technique || '').toLowerCase();
     const allowed = spec[plc] || deriveTechsFromKey(plc).map(x=>String(x).toLowerCase());
 
-    // recadrage technique
+    // recadrage technique : ex. dtg -> dtfilm si le placement est DTF-only
     if (!tech || !allowed.includes(tech)) {
-      // mapping trivial dtg -> dtfilm si on voit un contexte DTF
       if (tech==='dtg' && allowed.includes('dtfilm')) tech='dtfilm';
       else tech = allowed[0];
     }
@@ -101,17 +103,26 @@ function normalisePlacements(incoming, spec){
   }
   return out;
 }
-function ensureRequiredOptions(options, productSchema, placements){
+function ensureOptions(options, productSchema, placements){
   const out = Array.isArray(options) ? [...options] : [];
   const opts = productSchema?.options || productSchema?.product_options || [];
 
-  // stitch_color auto si embroidery détecté
-  const usesEmbroidery = Array.isArray(placements) && placements.some(p => /embro/i.test(p.technique||''));
-  if (usesEmbroidery && !out.find(o => o.id === 'stitch_color')) {
-    out.push({ id: 'stitch_color', value: 'black' });
+  // stitch_color : AJOUT TOUJOURS si l'option existe dans le schéma (AOP & Embroidery)
+  const hasStitchInSchema = (opts||[]).some(o => (o.id||o.code||o.name)==='stitch_color');
+  const usesEmbroidery    = Array.isArray(placements) && placements.some(p => /embro/i.test(p.technique||''));
+  if ((hasStitchInSchema || usesEmbroidery) && !out.find(o => o.id==='stitch_color')) {
+    // si le schéma donne des valeurs, préfère 'black' si elle existe
+    const stitchOpt = (opts||[]).find(o => (o.id||o.code||o.name)==='stitch_color');
+    const values = stitchOpt ? (stitchOpt.values || stitchOpt.allowed_values || []) : [];
+    let val = 'black';
+    if (Array.isArray(values) && values.length){
+      const vBlack = values.find(v => String(v.value||v).toLowerCase()==='black');
+      val = vBlack ? (vBlack.value||vBlack) : (values[0].value||values[0]);
+    }
+    out.push({ id:'stitch_color', value: val });
   }
 
-  // autres options requises -> 1ère valeur par défaut
+  // autres options "required" -> 1ère valeur par défaut
   for (const o of (opts||[])) {
     const id = o.id || o.code || o.name;
     if (!id) continue;
@@ -124,7 +135,7 @@ function ensureRequiredOptions(options, productSchema, placements){
       const first = values[0];
       out.push({ id, value: (first.value ?? first) });
     } else {
-      out.push({ id, value: id==='stitch_color' ? 'black' : true });
+      out.push({ id, value: true });
     }
   }
   return out;
@@ -179,8 +190,8 @@ module.exports=async(req,res)=>{
       return res.status(400).json({ ok:false, error:'No design layers provided' });
     }
 
-    // 6) Options sûres (stitch_color + requises)
-    const safeOptions = ensureRequiredOptions(options, productSchema, normPlacements);
+    // 6) Options (stitch_color toujours si dispo, + required)
+    const safeOptions = ensureOptions(options, productSchema, normPlacements);
 
     // 7) Payload Printful v2
     const orderPayload={

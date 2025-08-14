@@ -7,6 +7,23 @@ function cors(res){
   res.setHeader('Access-Control-Max-Age','86400');
 }
 
+// Récupère la liste des pays Printful (codes ISO2)
+async function pfCountries(token){
+  const r = await fetch('https://api.printful.com/v2/countries', {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  const j = await r.json().catch(()=> ({}));
+  if (!r.ok) {
+    const msg = j?.error?.message || 'Printful countries';
+    const e = new Error(msg); e.status = r.status; e.details = j; throw e;
+  }
+  const arr = (j.data || j || []).map(c =>
+    String(c.code || c.country_code || c.alpha2 || c.id || '').toUpperCase()
+  );
+  // Garde uniquement les ISO2
+  return Array.from(new Set(arr.filter(c => /^[A-Z]{2}$/.test(c))));
+}
+
 module.exports = async (req, res) => {
   cors(res);
   if (req.method === 'OPTIONS') return res.status(204).end();
@@ -15,6 +32,8 @@ module.exports = async (req, res) => {
   try {
     const SK = process.env.STRIPE_SECRET_KEY;
     if (!SK) return res.status(500).json({ error: 'Missing STRIPE_SECRET_KEY' });
+
+    const PF_TOKEN = process.env.PRINTFUL_TOKEN_ORDERS || process.env.PRINTFUL_TOKEN_CATALOG;
 
     const body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
     const {
@@ -49,7 +68,7 @@ module.exports = async (req, res) => {
       options: it.options || []
     }));
 
-    // ⬇️ Construire les params avec append(), pas avec un objet littéral
+    // -------- Construire les params avec append()
     const params = new URLSearchParams();
     params.append('mode', 'payment');
     params.append('success_url', success_url);
@@ -61,8 +80,15 @@ module.exports = async (req, res) => {
     params.append('shipping_options[0][shipping_rate_data][fixed_amount][amount]', String(Number(shipping.amount || 0)));
     params.append('shipping_options[0][shipping_rate_data][fixed_amount][currency]', currency);
 
-    // ✅ Liste des pays autorisés (un append par pays)
-    for (const c of ['LU','FR','BE','DE','NL']) {
+    // ✅ Pays autorisés dynamiques (tous les pays que Printful dessert)
+    let allowedCountries = ['US','CA','GB','AU','NZ','FR','DE','NL','BE','LU']; // fallback raisonnable
+    try {
+      if (PF_TOKEN) {
+        const fromPF = await pfCountries(PF_TOKEN);
+        if (fromPF?.length) allowedCountries = fromPF;
+      }
+    } catch (_) { /* fallback gardé */ }
+    for (const c of allowedCountries) {
       params.append('shipping_address_collection[allowed_countries][]', c);
     }
 

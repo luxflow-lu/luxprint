@@ -230,36 +230,43 @@ module.exports = async (req, res) => {
   try{
     const SK=process.env.STRIPE_SECRET_KEY;
     const PF_TOKEN=process.env.PRINTFUL_TOKEN_ORDERS||process.env.PRINTFUL_TOKEN_CATALOG;
-    const PF_STORE_ID=process.env.PRINTFUL_STORE_ID||'';
+    const PF_STORE_ID=process.env.PRINTFUL_STORE_ID;
     const PF_CONFIRM=(process.env.PRINTFUL_CONFIRM||'true').toLowerCase()!=='false';
+
     if(!SK) return res.status(500).json({ok:false,error:'Missing STRIPE_SECRET_KEY'});
     if(!PF_TOKEN) return res.status(500).json({ok:false,error:'Missing PRINTFUL token'});
+    if(!PF_STORE_ID) return res.status(500).json({ok:false,error:'Missing PRINTFUL_STORE_ID'});
 
     const {session_id}=typeof req.body==='string'?JSON.parse(req.body):(req.body||{});
     if(!session_id) return res.status(400).json({ok:false,error:'Missing session_id'});
 
+    // Stripe
     const session=await sget(`/checkout/sessions/${session_id}`,SK);
     if(session.payment_status!=='paid') return res.status(400).json({ok:false,error:'Payment not settled',payment_status:session.payment_status});
     const pi=session.payment_intent?await sget(`/payment_intents/${session.payment_intent}?expand[]=latest_charge`,SK):null;
     const charge=pi?.latest_charge||(pi?.charges?.data?.[0]||null);
 
+    // Metadata cart
     const m = session.metadata || {};
     const productIdMeta = Number(m.product_id || 0);
     let cart=[]; try{ cart=JSON.parse(m.cart_json||'[]'); }catch(_){}
     if(!Array.isArray(cart) || !cart.length) return res.status(400).json({ok:false,error:'Missing cart metadata'});
 
-    const item = cart[0]; // mono-produit
+    const item = cart[0];
     const variantId = Number(item?.variant_id || 0);
     const quantity  = Math.max(1, parseInt(item?.quantity || 1, 10));
     let placements = item?.placements || [];
     let options    = item?.options    || [];
     if(!variantId) return res.status(400).json({ok:false,error:'Missing catalog_variant_id'});
 
+    // Adresse
     const recipient = pickAddr({session,pi,charge});
     if(!recipient) return res.status(400).json({ok:false,error:'Missing or incomplete recipient address'});
 
+    // external_id ≤ 32
     const external_id='cs_'+createHash('sha256').update(session.id).digest('hex').slice(0,29);
 
+    // Schéma produit
     let productSchema=null;
     let productId = productIdMeta;
     try {
@@ -284,19 +291,20 @@ module.exports = async (req, res) => {
       order_items: [{
         catalog_variant_id: variantId,
         source: 'catalog',
-        quantity: quantity,                              // ✅ quantité côté Printful
+        quantity: quantity,
         product_options,
         placements: normPlacements
       }]
     };
 
-    // Create + fallbacks
+    // ----- Create + fallbacks automatiques
     let created;
     try{
       created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
     }catch(e1){
       const msg = (e1.details?.error?.message || e1.message || '').toLowerCase();
 
+      // 1) Placement X cannot be used with Y technique
       const mPlcTech = msg.match(/placement\s*`?([a-z0-9_\-]+)`?\s*cannot be used with\s*`?([a-z0-9_\-]+)`?\s*technique/i);
       if (mPlcTech){
         const badPlc = mPlcTech[1];
@@ -329,9 +337,9 @@ module.exports = async (req, res) => {
     }
 
     const oid = created?.data?.id;
-    if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created});
+    if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created, store_id: PF_STORE_ID});
 
-    // Confirm avec retry
+    // Confirm (retry si calcul/process)
     let confirmation=null;
     if(PF_CONFIRM){
       for(let i=0;i<12;i++){
@@ -344,7 +352,12 @@ module.exports = async (req, res) => {
       }
     }
 
-    res.status(200).json({ok:true, printful:{created,confirmation}});
+    res.status(200).json({
+      ok:true,
+      printful_order_id: oid,
+      store_id: PF_STORE_ID,
+      printful:{created,confirmation}
+    });
   }catch(e){
     res.status(e.status||500).json({ok:false,error:e.message,details:e.details});
   }

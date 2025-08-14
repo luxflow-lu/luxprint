@@ -1,26 +1,30 @@
 // /api/stripe/checkout.js
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*'); // limite à ton domaine en prod
+  res.setHeader('Access-Control-Allow-Origin','*'); // en prod: mets ton domaine Webflow
   res.setHeader('Vary','Origin');
   res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Requested-With');
   res.setHeader('Access-Control-Max-Age','86400');
 }
 
-// Récupère la liste des pays Printful (codes ISO2)
+// Stripe: liste officielle des codes pays acceptés (ISO2 + codes spéciaux Stripe)
+const STRIPE_ALLOWED = new Set([
+  'AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'
+]);
+
+// Printful: pays (ISO2) – on filtre ensuite par la whitelist Stripe
 async function pfCountries(token){
   const r = await fetch('https://api.printful.com/v2/countries', {
-    headers: { Authorization: `Bearer ${token}` }
+    headers: token ? { Authorization: `Bearer ${token}` } : {}
   });
   const j = await r.json().catch(()=> ({}));
   if (!r.ok) {
-    const msg = j?.error?.message || 'Printful countries';
-    const e = new Error(msg); e.status = r.status; e.details = j; throw e;
+    const e = new Error(j?.error?.message || 'Printful countries'); e.status=r.status; e.details=j; throw e;
   }
   const arr = (j.data || j || []).map(c =>
     String(c.code || c.country_code || c.alpha2 || c.id || '').toUpperCase()
   );
-  // Garde uniquement les ISO2
+  // garde ISO2 uniquement
   return Array.from(new Set(arr.filter(c => /^[A-Z]{2}$/.test(c))));
 }
 
@@ -49,6 +53,7 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'No items' });
     }
 
+    // lignes Stripe
     const line_items = items.map(it => ({
       quantity: Number(it.quantity || 1),
       price_data: {
@@ -61,6 +66,7 @@ module.exports = async (req, res) => {
       }
     }));
 
+    // panier compact pour metadata
     const compactCart = items.map((it, idx) => ({
       i: idx,
       variant_id: Number(it.catalog_variant_id || it.variant_id || 0),
@@ -68,26 +74,28 @@ module.exports = async (req, res) => {
       options: it.options || []
     }));
 
-    // -------- Construire les params avec append()
+    // ----- params Stripe (avec append)
     const params = new URLSearchParams();
     params.append('mode', 'payment');
     params.append('success_url', success_url);
     params.append('cancel_url', cancel_url);
 
-    // Tarif de livraison
+    // Livraison
     params.append('shipping_options[0][shipping_rate_data][type]', 'fixed_amount');
     params.append('shipping_options[0][shipping_rate_data][display_name]', shipping.name || 'Livraison');
     params.append('shipping_options[0][shipping_rate_data][fixed_amount][amount]', String(Number(shipping.amount || 0)));
     params.append('shipping_options[0][shipping_rate_data][fixed_amount][currency]', currency);
 
-    // ✅ Pays autorisés dynamiques (tous les pays que Printful dessert)
-    let allowedCountries = ['US','CA','GB','AU','NZ','FR','DE','NL','BE','LU']; // fallback raisonnable
+    // ✅ Pays : Printful ∩ Stripe
+    let allowedCountries = ['FR','DE','LU','BE','NL','ES','IT','PT','GB','IE','US','CA']; // fallback
     try {
-      if (PF_TOKEN) {
-        const fromPF = await pfCountries(PF_TOKEN);
-        if (fromPF?.length) allowedCountries = fromPF;
-      }
-    } catch (_) { /* fallback gardé */ }
+      const pf = await pfCountries(PF_TOKEN);
+      const filtered = pf.filter(c => STRIPE_ALLOWED.has(c));
+      if (filtered.length) allowedCountries = filtered;
+    } catch (_) { /* garde fallback */ }
+
+    // Tri pour UX stable
+    allowedCountries.sort();
     for (const c of allowedCountries) {
       params.append('shipping_address_collection[allowed_countries][]', c);
     }
@@ -103,7 +111,7 @@ module.exports = async (req, res) => {
       });
     });
 
-    // Metadata (pour /api/stripe/confirm)
+    // Metadata pour /api/stripe/confirm
     params.append('metadata[product_id]', String(product_id || ''));
     params.append('metadata[cart_json]', JSON.stringify(compactCart));
 

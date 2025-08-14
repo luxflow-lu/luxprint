@@ -1,10 +1,12 @@
 // /api/stripe/confirm.js
-// Stripe -> metadata -> normalisation placements/techniques via schéma v2 -> options (stitch_color toujours si dispo) -> create + confirm (retry)
+// Stripe -> metadata(cart_json) -> charge le schéma produit via product_id OU via variant_id
+// -> normalise placements/techniques -> ajoute stitch_color (AOP/Embroidery)
+// -> crée et confirme l'ordre Printful v2 (avec retry)
 
 const { createHash } = require('crypto');
 
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*');   // restreins à ton domaine en prod
+  res.setHeader('Access-Control-Allow-Origin','*');   // restreins en prod
   res.setHeader('Vary','Origin');
   res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Requested-With');
@@ -12,7 +14,7 @@ function cors(res){
 }
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-// ---- Stripe helpers
+// ---- Stripe
 async function sget(path,sk){
   const r=await fetch(`https://api.stripe.com/v1${path}`,{headers:{Authorization:`Bearer ${sk}`}});
   const j=await r.json();
@@ -32,7 +34,7 @@ function pickAddr({session,pi,charge}){
   return { name, address1:a.line1, address2:a.line2||'', city:a.city||'', state_code:a.state||'', country_code:a.country||'', zip:a.postal_code||'', phone, email };
 }
 
-// ---- Printful v2 helpers
+// ---- Printful v2
 function pfHeaders(token,storeId){
   const h={Authorization:`Bearer ${token}`,'Content-Type':'application/json'}; if(storeId) h['X-PF-Store-Id']=String(storeId); return h;
 }
@@ -54,12 +56,18 @@ async function pfGetProduct(productId, token, storeId){
   if(!r.ok){ const e=new Error(j?.error?.message||JSON.stringify(j)); e.status=r.status; e.details=j; throw e; }
   return j?.data || j;
 }
+async function pfGetVariant(variantId, token, storeId){
+  const r=await fetch(`https://api.printful.com/v2/catalog-variants/${variantId}`,{headers:pfHeaders(token,storeId)});
+  const j=await r.json().catch(()=> ({}));
+  if(!r.ok){ const e=new Error(j?.error?.message||JSON.stringify(j)); e.status=r.status; e.details=j; throw e; }
+  return j?.data || j;
+}
 
-// ---- Normalisation placements/techniques + options
+// ---- Normalisation
 function deriveTechsFromKey(key){
   const k=String(key||'').toLowerCase();
   if (/_dtf$/.test(k) || k.includes('dtf')) return ['dtfilm'];     // DTF
-  if (k.includes('embroider')) return ['embroidery'];              // broderie
+  if (k.includes('embroider')) return ['embroidery'];              // Broderie
   if (k.includes('all-over') || k.includes('sublim')) return ['sublimation']; // AOP
   return ['dtfilm','dtg'];                                         // favorise dtfilm si doute
 }
@@ -91,7 +99,6 @@ function normalisePlacements(incoming, spec){
     let tech = String(p.technique || '').toLowerCase();
     const allowed = spec[plc] || deriveTechsFromKey(plc).map(x=>String(x).toLowerCase());
 
-    // recadrage technique : ex. dtg -> dtfilm si le placement est DTF-only
     if (!tech || !allowed.includes(tech)) {
       if (tech==='dtg' && allowed.includes('dtfilm')) tech='dtfilm';
       else tech = allowed[0];
@@ -107,11 +114,10 @@ function ensureOptions(options, productSchema, placements){
   const out = Array.isArray(options) ? [...options] : [];
   const opts = productSchema?.options || productSchema?.product_options || [];
 
-  // stitch_color : AJOUT TOUJOURS si l'option existe dans le schéma (AOP & Embroidery)
+  // stitch_color SI dispo dans le schéma OU si technique = embroidery / sublimation (AOP)
   const hasStitchInSchema = (opts||[]).some(o => (o.id||o.code||o.name)==='stitch_color');
-  const usesEmbroidery    = Array.isArray(placements) && placements.some(p => /embro/i.test(p.technique||''));
-  if ((hasStitchInSchema || usesEmbroidery) && !out.find(o => o.id==='stitch_color')) {
-    // si le schéma donne des valeurs, préfère 'black' si elle existe
+  const needsByTechnique  = Array.isArray(placements) && placements.some(p => /embro|sublim/i.test(p.technique||''));
+  if ((hasStitchInSchema || needsByTechnique) && !out.find(o => o.id==='stitch_color')) {
     const stitchOpt = (opts||[]).find(o => (o.id||o.code||o.name)==='stitch_color');
     const values = stitchOpt ? (stitchOpt.values || stitchOpt.allowed_values || []) : [];
     let val = 'black';
@@ -142,73 +148,83 @@ function ensureOptions(options, productSchema, placements){
 }
 
 // ---- Handler
-module.exports=async(req,res)=>{
+module.exports = async (req, res) => {
   cors(res);
-  if(req.method==='OPTIONS') return res.status(204).end();
-  if(req.method!=='POST') return res.status(405).json({ok:false,error:'Method not allowed'});
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'POST') return res.status(405).json({ ok:false, error:'Method not allowed' });
 
   try{
     const SK=process.env.STRIPE_SECRET_KEY;
     const PF_TOKEN=process.env.PRINTFUL_TOKEN_ORDERS||process.env.PRINTFUL_TOKEN_CATALOG;
     const PF_STORE_ID=process.env.PRINTFUL_STORE_ID||'';
     const PF_CONFIRM=(process.env.PRINTFUL_CONFIRM||'true').toLowerCase()!=='false';
-    if(!SK) return res.status(500).json({ok:false,error:'Missing STRIPE_SECRET_KEY env'});
-    if(!PF_TOKEN) return res.status(500).json({ok:false,error:'Missing PRINTFUL token env'});
+    if(!SK) return res.status(500).json({ok:false,error:'Missing STRIPE_SECRET_KEY'});
+    if(!PF_TOKEN) return res.status(500).json({ok:false,error:'Missing PRINTFUL token'});
 
     const {session_id}=typeof req.body==='string'?JSON.parse(req.body):(req.body||{});
     if(!session_id) return res.status(400).json({ok:false,error:'Missing session_id'});
 
     // 1) Stripe
     const session=await sget(`/checkout/sessions/${session_id}`,SK);
+    if(session.payment_status!=='paid') return res.status(400).json({ok:false,error:'Payment not settled',payment_status:session.payment_status});
     const pi=session.payment_intent?await sget(`/payment_intents/${session.payment_intent}?expand[]=latest_charge`,SK):null;
     const charge=pi?.latest_charge||(pi?.charges?.data?.[0]||null);
-    if(session.payment_status!=='paid') return res.status(400).json({ok:false,error:'Payment not settled',payment_status:session.payment_status});
 
-    // 2) Metadata
-    const m=session.metadata||{};
-    const variantId=Number(m.catalog_variant_id||0);
-    const productId=Number(m.product_id||0);
-    let placements=[]; try{ placements=JSON.parse(m.placements_json||'[]'); }catch(_){}
-    let options=[];    try{ options   =JSON.parse(m.options_json   ||'[]'); }catch(_){}
-    if(!variantId) return res.status(400).json({ok:false,error:'Missing catalog_variant_id metadata'});
+    // 2) Cart depuis metadata
+    const m = session.metadata || {};
+    const productIdMeta = Number(m.product_id || 0);
+    let cart=[]; try{ cart=JSON.parse(m.cart_json||'[]'); }catch(_){}
+    if(!Array.isArray(cart) || !cart.length) return res.status(400).json({ok:false,error:'Missing cart metadata'});
+
+    // (mono-produit pour l’instant)
+    const item = cart[0];
+    const variantId = Number(item?.variant_id || 0);
+    let placements = item?.placements || [];
+    let options    = item?.options    || [];
+
+    if(!variantId) return res.status(400).json({ok:false,error:'Missing catalog_variant_id'});
 
     // 3) Adresse
-    const recipient=pickAddr({session,pi,charge});
+    const recipient = pickAddr({session,pi,charge});
     if(!recipient) return res.status(400).json({ok:false,error:'Missing or incomplete recipient address'});
 
     // 4) external_id ≤ 32
     const external_id='cs_'+createHash('sha256').update(session.id).digest('hex').slice(0,29);
 
-    // 5) Schéma + normalisation placements
+    // 5) Schéma produit (via product_id, sinon via variant -> product)
     let productSchema=null;
+    let productId = productIdMeta;
+    if (!productId) {
+      try { const v = await pfGetVariant(variantId, PF_TOKEN, PF_STORE_ID); productId = Number(v?.product?.id || v?.product_id || 0); } catch(_) {}
+    }
     if (productId) {
       try { productSchema = await pfGetProduct(productId, PF_TOKEN, PF_STORE_ID); } catch(_) {}
     }
-    const spec = buildPlacementSpec(productSchema);
-    const normPlacements = normalisePlacements(placements, spec);
-    if (!normPlacements.length) {
-      return res.status(400).json({ ok:false, error:'No design layers provided' });
-    }
 
-    // 6) Options (stitch_color toujours si dispo, + required)
+    // 6) Normalisation placements/techniques
+    const spec = productSchema ? buildPlacementSpec(productSchema) : {};
+    const normPlacements = normalisePlacements(placements, spec);
+    if (!normPlacements.length) return res.status(400).json({ ok:false, error:'No design layers provided' });
+
+    // 7) Options (stitch_color si dispo OU si technique embroidery/sublimation)
     const safeOptions = ensureOptions(options, productSchema, normPlacements);
 
-    // 7) Payload Printful v2
-    const orderPayload={
+    // 8) Payload Printful v2
+    const orderPayload = {
       external_id,
       recipient,
-      order_items:[{
+      order_items: [{
         catalog_variant_id: variantId,
-        source:'catalog',
-        quantity:1,
-        options: safeOptions.map(o=>({id:o.id, value:o.value})),
+        source: 'catalog',
+        quantity: 1,
+        options: safeOptions.map(o => ({ id:o.id, value:o.value })),
         placements: normPlacements
       }]
     };
 
-    // 8) Create + confirm (retry si design/cost en cours)
-    const created=await pfCreate(orderPayload,PF_TOKEN,PF_STORE_ID);
-    const oid=created?.data?.id;
+    // 9) Create + confirm (retry si design/cost en cours)
+    const created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
+    const oid = created?.data?.id;
     if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created});
 
     let confirmation=null;
@@ -217,10 +233,7 @@ module.exports=async(req,res)=>{
         try{ confirmation=await pfConfirm(oid,PF_TOKEN,PF_STORE_ID); break; }
         catch(e){
           const msg=(e.details?.error?.message||'').toLowerCase();
-          if (e.status===409 || msg.includes('calculat') || msg.includes('process')) {
-            await sleep(2000);
-            continue;
-          }
+          if (e.status===409 || msg.includes('calculat') || msg.includes('process')) { await sleep(2000); continue; }
           throw e;
         }
       }

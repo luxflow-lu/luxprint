@@ -1,13 +1,8 @@
 // /api/stripe/confirm.js
-// Récupère la session Stripe -> adresse -> lit metadata (variant, placements, options, product_id) ->
-// Normalise placements/techniques avec schéma produit v2 -> ajoute options requises (stitch_color, etc.) ->
-// Crée l'ordre v2 (order_items + source:'catalog' + placements/layers + options) ->
-// Confirme l'ordre avec retry si "design/cost calculating".
-
 const { createHash } = require('crypto');
 
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*');
+  res.setHeader('Access-Control-Allow-Origin','*');   // serre ensuite à ton domaine
   res.setHeader('Vary','Origin');
   res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Requested-With');
@@ -15,6 +10,7 @@ function cors(res){
 }
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
+// ---- Stripe helpers
 async function sget(path,sk){
   const r=await fetch(`https://api.stripe.com/v1${path}`,{headers:{Authorization:`Bearer ${sk}`}});
   const j=await r.json();
@@ -34,7 +30,7 @@ function pickAddr({session,pi,charge}){
   return { name, address1:a.line1, address2:a.line2||'', city:a.city||'', state_code:a.state||'', country_code:a.country||'', zip:a.postal_code||'', phone, email };
 }
 
-// ---- Printful helpers (v2)
+// ---- Printful v2 helpers
 function pfHeaders(token,storeId){
   const h={Authorization:`Bearer ${token}`,'Content-Type':'application/json'}; if(storeId) h['X-PF-Store-Id']=String(storeId); return h;
 }
@@ -57,16 +53,23 @@ async function pfGetProduct(productId, token, storeId){
   return j?.data || j;
 }
 
-// ---- Build/normalise placements & ensure required options
+// ---- Normalisation placements/techniques + options requises
+function deriveTechsFromKey(key){
+  const k=String(key||'').toLowerCase();
+  if (/_dtf$/.test(k) || k.includes('dtf')) return ['dtfilm'];   // DTF
+  if (k.includes('embroider')) return ['embroidery'];            // broderie
+  return ['dtfilm','dtg'];                                       // ordre: favorise dtfilm si doute
+}
 function buildPlacementSpec(schema){
   const arr = schema?.placements || schema?.available_placements || [];
   const spec = {};
   for (const p of arr){
     const key = p?.key || p?.placement || p?.id || p?.name;
     if (!key || key === 'mockup') continue;
-    const techs = Array.isArray(p?.techniques) ? p.techniques
-                : Array.isArray(p?.available_techniques) ? p.available_techniques
-                : [];
+    let techs = [];
+    if (Array.isArray(p?.techniques) && p.techniques.length) techs = p.techniques;
+    else if (Array.isArray(p?.available_techniques) && p.available_techniques.length) techs = p.available_techniques;
+    else techs = deriveTechsFromKey(key);
     spec[key] = techs.map(t => String(t).toLowerCase());
   }
   return spec;
@@ -78,14 +81,20 @@ function normalisePlacements(incoming, spec){
   for (const p of incoming){
     const url = p?.layers?.[0]?.url;
     if (!url) continue;
+
     let plc = p.placement || 'front';
     if (!spec[plc]) plc = keys[0] || 'front';
 
     let tech = String(p.technique || '').toLowerCase();
-    const allowed = spec[plc] || [];
-    if (allowed.length){
-      if (!allowed.includes(tech)) tech = allowed[0];
+    const allowed = spec[plc] || deriveTechsFromKey(plc).map(x=>String(x).toLowerCase());
+
+    // recadrage technique
+    if (!tech || !allowed.includes(tech)) {
+      // mapping trivial dtg -> dtfilm si on voit un contexte DTF
+      if (tech==='dtg' && allowed.includes('dtfilm')) tech='dtfilm';
+      else tech = allowed[0];
     }
+
     const item = { placement: plc, technique: tech || undefined, layers: [{ type:'file', url: String(url).replace('ucarecd.net','ucarecdn.com') }] };
     const i = out.findIndex(x => x.placement === plc);
     if (i >= 0) out[i] = item; else out.push(item);
@@ -96,7 +105,7 @@ function ensureRequiredOptions(options, productSchema, placements){
   const out = Array.isArray(options) ? [...options] : [];
   const opts = productSchema?.options || productSchema?.product_options || [];
 
-  // stitch_color si embroidery détecté
+  // stitch_color auto si embroidery détecté
   const usesEmbroidery = Array.isArray(placements) && placements.some(p => /embro/i.test(p.technique||''));
   if (usesEmbroidery && !out.find(o => o.id === 'stitch_color')) {
     out.push({ id: 'stitch_color', value: 'black' });
@@ -121,6 +130,7 @@ function ensureRequiredOptions(options, productSchema, placements){
   return out;
 }
 
+// ---- Handler
 module.exports=async(req,res)=>{
   cors(res);
   if(req.method==='OPTIONS') return res.status(204).end();
@@ -158,19 +168,19 @@ module.exports=async(req,res)=>{
     // 4) external_id ≤ 32
     const external_id='cs_'+createHash('sha256').update(session.id).digest('hex').slice(0,29);
 
-    // 5) Schéma produit + normalisation placements/techniques
+    // 5) Schéma + normalisation placements
     let productSchema=null;
     if (productId) {
       try { productSchema = await pfGetProduct(productId, PF_TOKEN, PF_STORE_ID); } catch(_) {}
     }
-    const spec = productSchema ? buildPlacementSpec(productSchema) : {};
-    let normPlacements = normalisePlacements(placements, spec);
+    const spec = buildPlacementSpec(productSchema);
+    const normPlacements = normalisePlacements(placements, spec);
     if (!normPlacements.length) {
       return res.status(400).json({ ok:false, error:'No design layers provided' });
     }
 
     // 6) Options sûres (stitch_color + requises)
-    let safeOptions = ensureRequiredOptions(options, productSchema, normPlacements);
+    const safeOptions = ensureRequiredOptions(options, productSchema, normPlacements);
 
     // 7) Payload Printful v2
     const orderPayload={
@@ -185,7 +195,7 @@ module.exports=async(req,res)=>{
       }]
     };
 
-    // 8) Create + (optionnel) confirm avec retry si coûts/design en cours
+    // 8) Create + confirm (retry si design/cost en cours)
     const created=await pfCreate(orderPayload,PF_TOKEN,PF_STORE_ID);
     const oid=created?.data?.id;
     if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created});
@@ -197,7 +207,7 @@ module.exports=async(req,res)=>{
         catch(e){
           const msg=(e.details?.error?.message||'').toLowerCase();
           if (e.status===409 || msg.includes('calculat') || msg.includes('process')) {
-            await sleep(2000); // 2s
+            await sleep(2000);
             continue;
           }
           throw e;

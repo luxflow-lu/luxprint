@@ -126,7 +126,7 @@ function normalisePlacements(incoming, spec){
   return out;
 }
 
-// options produit (booléens, valeurs autorisées, lifelike masquée si non requise, couture auto)
+// options produit (booléens, valeurs autorisées, couture auto)
 function coerceBoolean(v){
   if (v === true || v === false) return v;
   const s = String(v).toLowerCase();
@@ -143,6 +143,7 @@ function pickFirstValue(opt){
 }
 function ensureProductOptions(incoming, schema, placements){
   const all = collectAllOptions(schema);
+
   let out = Array.isArray(incoming)
     ? incoming.map(o => {
         const name = (o.name || o.id);
@@ -162,9 +163,11 @@ function ensureProductOptions(incoming, schema, placements){
   const has = n => out.find(x => String(x.name) === String(n));
   const get = n => all.find(x => x.id === n);
 
+  // lifelike : si non requis → supprime
   const likeDef = get('lifelike');
   if (likeDef && !likeDef.required) out = out.filter(x => x.name !== 'lifelike');
 
+  // ajouter les REQUIRED manquantes
   for (const opt of all){
     if (!opt.required) continue;
     if (has(opt.id)) continue;
@@ -175,16 +178,22 @@ function ensureProductOptions(incoming, schema, placements){
     out.push({ name: opt.id, value: defVal });
   }
 
-  const needStitch = Array.isArray(placements) && placements.some(p => /embro|cut[-_\s]?sew/i.test(p.technique||''));
-  if (needStitch && !out.find(o => /stitch|seam|thread/i.test(String(o.name)) && /color/i.test(String(o.name)))){
-    const stitchOpt = all.find(o => /color/i.test(o.title||'') && /(stitch|seam|thread)/i.test(o.title||''));
-    if (stitchOpt && Array.isArray(stitchOpt.values) && stitchOpt.values.length){
-      out.push({ name: stitchOpt.id, value: (stitchOpt.values[0].value||stitchOpt.values[0]) });
-    } else {
-      out.push({ name:'stitch_color', value:'black' });
+  // --- PATCH ROBUSTE stitch_color ---
+  const needCutSew = Array.isArray(placements) && placements.some(p => /cut[-_\s]?sew|all[-_\s]?over/i.test(p.technique||p.placement||''));
+  const schemaHasStitch = !!get('stitch_color');
+  const hasStitch = !!has('stitch_color');
+  if ((needCutSew || schemaHasStitch) && !hasStitch){
+    const def = get('stitch_color');
+    let val = 'black';
+    if (def && Array.isArray(def.values) && def.values.length){
+      const allowed = def.values.map(v => v.value ?? v);
+      val = allowed.includes('black') ? 'black' : allowed[0];
     }
+    out.push({ name:'stitch_color', value: val });
   }
+  // -----------------------------------
 
+  // dédup (le dernier gagne)
   const map = new Map();
   for (const o of out) map.set(String(o.name), o.value);
   return Array.from(map, ([name,value]) => ({ name, value }));
@@ -297,14 +306,14 @@ module.exports = async (req, res) => {
       }]
     };
 
-    // ----- Create + fallbacks automatiques
+    // Create + fallbacks
     let created;
     try{
       created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
     }catch(e1){
       const msg = (e1.details?.error?.message || e1.message || '').toLowerCase();
 
-      // 1) Placement X cannot be used with Y technique
+      // technique non autorisée pour ce placement
       const mPlcTech = msg.match(/placement\s*`?([a-z0-9_\-]+)`?\s*cannot be used with\s*`?([a-z0-9_\-]+)`?\s*technique/i);
       if (mPlcTech){
         const badPlc = mPlcTech[1];
@@ -317,11 +326,15 @@ module.exports = async (req, res) => {
         });
         created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
       }
+      // placements supplémentaires requis → réplique le visuel + force techniques autorisées
       else if (/must use additional placements|available placements are/i.test(msg)){
         orderPayload.order_items[0].placements = fillMissingPlacements(orderPayload.order_items[0].placements, spec);
         orderPayload.order_items[0].placements = forceAllowedTechniqueForPlacement(orderPayload.order_items[0].placements, spec);
+        // (re)vérifie stitch_color après duplication si besoin
+        orderPayload.order_items[0].product_options = ensureProductOptions(product_options, productSchema, orderPayload.order_items[0].placements);
         created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
       }
+      // technique invalide → remappe sur la 1ʳᵉ autorisée renvoyée par l’erreur
       else {
         const mTech = msg.match(/invalid technique used:\s*`?([a-z\-]+)`?.*?\[(.*?)\]/i);
         if (mTech) {
@@ -339,7 +352,7 @@ module.exports = async (req, res) => {
     const oid = created?.data?.id;
     if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created, store_id: PF_STORE_ID});
 
-    // Confirm (retry si calcul/process)
+    // Confirm avec retry
     let confirmation=null;
     if(PF_CONFIRM){
       for(let i=0;i<12;i++){

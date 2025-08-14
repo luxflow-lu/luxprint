@@ -2,7 +2,7 @@
 const { createHash } = require('crypto');
 
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*'); // restreins en prod
+  res.setHeader('Access-Control-Allow-Origin','*'); // limite à ton domaine en prod
   res.setHeader('Vary','Origin');
   res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Requested-With');
@@ -61,10 +61,10 @@ async function pfGetVariant(variantId, token, storeId){
   return j?.data || j;
 }
 
-// ---------- Utilitaires schéma & placements
+// ---------- Utilitaires schéma / placements / options
 function collectAllOptions(schema){
   if (!schema) return [];
-  const keys = Object.keys(schema || {}).filter(k => /option/i.test(k));
+  const keys = Object.keys(schema || {}).filter(k => /option/i.test(k)); // options / product_options / available_options...
   const arrs = keys.map(k => Array.isArray(schema[k]) ? schema[k] : []).flat();
   return arrs.map(o => ({
     id: (o.id||o.code||o.name||'').toString(),
@@ -72,7 +72,8 @@ function collectAllOptions(schema){
     values: Array.isArray(o.values) ? o.values
           : Array.isArray(o.allowed_values) ? o.allowed_values
           : [],
-    required: !!(o.required || o.is_required)
+    required: !!(o.required || o.is_required),
+    type: String(o.type||'').toLowerCase()
   })).filter(o => o.id || o.title);
 }
 function buildPlacementSpec(schema){
@@ -118,7 +119,7 @@ function normalisePlacements(incoming, spec){
   return out;
 }
 
-// ---------- Options produit (v2 = product_options [{name,value}])
+// couture-like IDs
 function findStitchLikeIds(schema){
   const all = collectAllOptions(schema);
   const ids = [];
@@ -131,6 +132,12 @@ function findStitchLikeIds(schema){
   ids.sort((a,b)=> (a==='stitch_color'? -1 : b==='stitch_color'? 1 : 0));
   return Array.from(new Set(ids));
 }
+
+function coerceBoolean(v){
+  if (v === true || v === false) return v;
+  const s = String(v).toLowerCase();
+  return (s==='true' || s==='1' || s==='yes' || s==='on');
+}
 function pickFirstValue(opt){
   const values = opt?.values || [];
   if (Array.isArray(values) && values.length){
@@ -140,23 +147,42 @@ function pickFirstValue(opt){
   }
   return 'black';
 }
+
 function ensureProductOptions(incoming, schema, placements){
+  const all = collectAllOptions(schema);
+
+  // transforme ce qui vient du client (id/name,value) vers [{name,value}] + coercion bool
   const out = Array.isArray(incoming)
-    ? incoming.map(o => ({ name: (o.name||o.id), value: o.value }))
+    ? incoming.map(o => {
+        const name = (o.name || o.id);
+        const def  = all.find(x => x.id === name);
+        let value  = o.value;
+        if (def?.type === 'boolean') value = coerceBoolean(value);
+        // si la valeur n'appartient pas aux valeurs autorisées, forcer la 1ère autorisée
+        if (Array.isArray(def?.values) && def.values.length){
+          const allowed = def.values.map(v => v.value ?? v);
+          if (!allowed.some(av => String(av) === String(value))) {
+            value = allowed[0];
+          }
+        }
+        return { name, value };
+      })
     : [];
 
   const has = n => out.find(x => String(x.name) === String(n));
-  const all = collectAllOptions(schema);
 
-  // Required
+  // Required manquantes
   for (const opt of all){
     if (!opt.required) continue;
     if (has(opt.id)) continue;
-    const def = Array.isArray(opt.values) && opt.values.length ? (opt.values[0].value||opt.values[0]) : true;
-    out.push({ name: opt.id, value: def });
+    let defVal;
+    if (opt.type === 'boolean') defVal = false; // défaut sûr
+    else if (Array.isArray(opt.values) && opt.values.length) defVal = (opt.values[0].value||opt.values[0]);
+    else defVal = true;
+    out.push({ name: opt.id, value: defVal });
   }
 
-  // Couture (stitch/seam/thread color)
+  // Couture (stitch/seam/thread color) si présent dans le schéma OU technique embroidery/cut-sew
   const stitchIds = findStitchLikeIds(schema);
   const needsByTechnique = Array.isArray(placements) && placements.some(p => /embro|cut[-_\s]?sew/i.test(p.technique||''));
   if (stitchIds.length){
@@ -236,7 +262,7 @@ module.exports = async (req, res) => {
     let normPlacements = normalisePlacements(placements, spec);
     if (!normPlacements.length) return res.status(400).json({ ok:false, error:'No design layers provided' });
 
-    // Product options dynamiques
+    // ✅ Product options robustes (booléens, valeurs autorisées, couture…)
     let product_options = ensureProductOptions(options, productSchema, normPlacements);
 
     // Payload v2

@@ -7,14 +7,8 @@ function cors(res){
   res.setHeader('Access-Control-Max-Age','86400');
 }
 
-// ✅ Pays UE (27) — codes ISO2 acceptés par Stripe
-const EU27 = [
-  'AT','BE','BG','HR','CY','CZ','DE','DK','EE','ES','FI','FR','GR','HU','IE','IT',
-  'LT','LU','LV','MT','NL','PL','PT','RO','SE','SI','SK'
-];
-
-// Optionnel : décommente si tu veux inclure EEE + UK + CH
-// const EEA_UK_CH = ['IS','LI','NO','GB','CH'];
+// UE (27)
+const EU27 = ['AT','BE','BG','HR','CY','CZ','DE','DK','EE','ES','FI','FR','GR','HU','IE','IT','LT','LU','LV','MT','NL','PL','PT','RO','SE','SI','SK'];
 
 module.exports = async (req, res) => {
   cors(res);
@@ -31,6 +25,8 @@ module.exports = async (req, res) => {
       product_id = 0,
       items = [],
       shipping = { name: 'Livraison standard UE', amount: 479 },
+      client_log = '',
+      debug_log  = '',
       success_url = (req.headers.origin || 'https://luxprint.webflow.io') + '/merci?session_id={CHECKOUT_SESSION_ID}',
       cancel_url  = (req.headers.origin || 'https://luxprint.webflow.io')
     } = body;
@@ -39,20 +35,15 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'No items' });
     }
 
-    // Lignes Stripe
     const line_items = items.map(it => ({
       quantity: Number(it.quantity || 1),
       price_data: {
         currency,
         unit_amount: Number(it.unit_amount || 0),
-        product_data: {
-          name: it.name || 'Produit LuxPrint',
-          images: it.image ? [it.image] : []
-        }
+        product_data: { name: it.name || 'Produit LuxPrint', images: it.image ? [it.image] : [] }
       }
     }));
 
-    // Panier compact pour /api/stripe/confirm
     const compactCart = items.map((it, idx) => ({
       i: idx,
       variant_id: Number(it.catalog_variant_id || it.variant_id || 0),
@@ -60,25 +51,19 @@ module.exports = async (req, res) => {
       options: it.options || []
     }));
 
-    // ---------- Params Stripe (append obligatorio)
     const params = new URLSearchParams();
     params.append('mode', 'payment');
     params.append('success_url', success_url);
     params.append('cancel_url',  cancel_url);
 
-    // Livraison
     params.append('shipping_options[0][shipping_rate_data][type]', 'fixed_amount');
     params.append('shipping_options[0][shipping_rate_data][display_name]', shipping.name || 'Livraison');
     params.append('shipping_options[0][shipping_rate_data][fixed_amount][amount]', String(Number(shipping.amount || 0)));
     params.append('shipping_options[0][shipping_rate_data][fixed_amount][currency]', currency);
 
-    // ✅ Pays autorisés : UE uniquement (liste fixe et sûre)
-    const allowedCountries = EU27 /* .concat(EEA_UK_CH) */; // décommente ci-dessus si besoin
-    allowedCountries.forEach(c => {
-      params.append('shipping_address_collection[allowed_countries][]', c);
-    });
+    // pays autorisés : UE
+    EU27.forEach(c => params.append('shipping_address_collection[allowed_countries][]', c));
 
-    // Lignes
     line_items.forEach((li, idx) => {
       params.append(`line_items[${idx}][quantity]`,               String(li.quantity));
       params.append(`line_items[${idx}][price_data][currency]`,    li.price_data.currency);
@@ -89,21 +74,20 @@ module.exports = async (req, res) => {
       });
     });
 
-    // Metadata pour post-paiement
+    // metadata pour /merci + webhook
     params.append('metadata[product_id]', String(product_id || ''));
-    params.append('metadata[cart_json]', JSON.stringify(compactCart));
+    params.append('metadata[cart_json]', JSON.stringify(compactCart).slice(0,5000));
+    if (client_log) params.append('metadata[client_log]', String(client_log).slice(0,500));
+    if (debug_log)  params.append('metadata[debug_log]',  String(debug_log).slice(0,5000));
 
-    // Appel Stripe
     const resp = await fetch('https://api.stripe.com/v1/checkout/sessions', {
       method: 'POST',
       headers: { Authorization: `Bearer ${SK}`, 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params
     });
-    const data = await resp.json();
-    if (!resp.ok) {
-      return res.status(resp.status).json({ error: data?.error?.message || 'Stripe error', details: data });
-    }
 
+    const data = await resp.json();
+    if (!resp.ok) return res.status(resp.status).json({ error: data?.error?.message || 'Stripe error', details: data });
     return res.status(200).json({ url: data.url });
   } catch (e) {
     return res.status(500).json({ error: e.message });

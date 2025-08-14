@@ -1,17 +1,20 @@
 // /api/stripe/checkout.js
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*'); // en prod, mets https://luxprint.webflow.io
+  res.setHeader('Access-Control-Allow-Origin','*'); // en prod: limite à https://luxprint.webflow.io
   res.setHeader('Vary','Origin');
   res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Requested-With');
   res.setHeader('Access-Control-Max-Age','86400');
 }
 
-// Liste officielle des codes pays que Stripe accepte pour shipping_address_collection
-// (inclut quelques codes “spéciaux” Stripe comme AC, TA, XK, ZZ).
-const STRIPE_ALLOWED = new Set([
-  'AC','AD','AE','AF','AG','AI','AL','AM','AO','AQ','AR','AT','AU','AW','AX','AZ','BA','BB','BD','BE','BF','BG','BH','BI','BJ','BL','BM','BN','BO','BQ','BR','BS','BT','BV','BW','BY','BZ','CA','CD','CF','CG','CH','CI','CK','CL','CM','CN','CO','CR','CV','CW','CY','CZ','DE','DJ','DK','DM','DO','DZ','EC','EE','EG','EH','ER','ES','ET','FI','FJ','FK','FO','FR','GA','GB','GD','GE','GF','GG','GH','GI','GL','GM','GN','GP','GQ','GR','GS','GT','GU','GW','GY','HK','HN','HR','HT','HU','ID','IE','IL','IM','IN','IO','IQ','IS','IT','JE','JM','JO','JP','KE','KG','KH','KI','KM','KN','KR','KW','KY','KZ','LA','LB','LC','LI','LK','LR','LS','LT','LU','LV','LY','MA','MC','MD','ME','MF','MG','MK','ML','MM','MN','MO','MQ','MR','MS','MT','MU','MV','MW','MX','MY','MZ','NA','NC','NE','NG','NI','NL','NO','NP','NR','NU','NZ','OM','PA','PE','PF','PG','PH','PK','PL','PM','PN','PR','PS','PT','PY','QA','RE','RO','RS','RU','RW','SA','SB','SC','SD','SE','SG','SH','SI','SJ','SK','SL','SM','SN','SO','SR','SS','ST','SV','SX','SZ','TA','TC','TD','TF','TG','TH','TJ','TK','TL','TM','TN','TO','TR','TT','TV','TW','TZ','UA','UG','US','UY','UZ','VA','VC','VE','VG','VN','VNU','VU','WF','WS','XK','YE','YT','ZA','ZM','ZW','ZZ'
-]);
+// ✅ Pays UE (27) — codes ISO2 acceptés par Stripe
+const EU27 = [
+  'AT','BE','BG','HR','CY','CZ','DE','DK','EE','ES','FI','FR','GR','HU','IE','IT',
+  'LT','LU','LV','MT','NL','PL','PT','RO','SE','SI','SK'
+];
+
+// Optionnel : décommente si tu veux inclure EEE + UK + CH
+// const EEA_UK_CH = ['IS','LI','NO','GB','CH'];
 
 module.exports = async (req, res) => {
   cors(res);
@@ -36,7 +39,7 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'No items' });
     }
 
-    // Construire les lignes Stripe
+    // Lignes Stripe
     const line_items = items.map(it => ({
       quantity: Number(it.quantity || 1),
       price_data: {
@@ -49,7 +52,7 @@ module.exports = async (req, res) => {
       }
     }));
 
-    // Panier compact dans la metadata (pour /api/stripe/confirm)
+    // Panier compact pour /api/stripe/confirm
     const compactCart = items.map((it, idx) => ({
       i: idx,
       variant_id: Number(it.catalog_variant_id || it.variant_id || 0),
@@ -57,23 +60,23 @@ module.exports = async (req, res) => {
       options: it.options || []
     }));
 
-    // ---------- Params Stripe (toujours via append)
+    // ---------- Params Stripe (append obligatorio)
     const params = new URLSearchParams();
     params.append('mode', 'payment');
     params.append('success_url', success_url);
-    params.append('cancel_url', cancel_url);
+    params.append('cancel_url',  cancel_url);
 
-    // Tarif de livraison
+    // Livraison
     params.append('shipping_options[0][shipping_rate_data][type]', 'fixed_amount');
     params.append('shipping_options[0][shipping_rate_data][display_name]', shipping.name || 'Livraison');
     params.append('shipping_options[0][shipping_rate_data][fixed_amount][amount]', String(Number(shipping.amount || 0)));
     params.append('shipping_options[0][shipping_rate_data][fixed_amount][currency]', currency);
 
-    // ✅ Pays : **tous** les pays supportés par Stripe (liste officielle ci-dessus)
-    const allowedCountries = Array.from(STRIPE_ALLOWED).sort();
-    for (const c of allowedCountries) {
+    // ✅ Pays autorisés : UE uniquement (liste fixe et sûre)
+    const allowedCountries = EU27 /* .concat(EEA_UK_CH) */; // décommente ci-dessus si besoin
+    allowedCountries.forEach(c => {
       params.append('shipping_address_collection[allowed_countries][]', c);
-    }
+    });
 
     // Lignes
     line_items.forEach((li, idx) => {
@@ -96,7 +99,6 @@ module.exports = async (req, res) => {
       headers: { Authorization: `Bearer ${SK}`, 'Content-Type': 'application/x-www-form-urlencoded' },
       body: params
     });
-
     const data = await resp.json();
     if (!resp.ok) {
       return res.status(resp.status).json({ error: data?.error?.message || 'Stripe error', details: data });

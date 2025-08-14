@@ -98,27 +98,38 @@ function deriveTechsFromKey(key){
   // fallback textile: essaiera dtg avant dtfilm quand on corrige
   return ['dtg','dtfilm'];
 }
+// ... haut du fichier identique à ta version en place ...
+
 function normalisePlacements(incoming, spec){
   if (!Array.isArray(incoming)) return [];
-  const keys = Object.keys(spec);
+  const keys = Object.keys(spec||{});
   const out = [];
   for (const p of incoming){
-    const url = p?.layers?.[0]?.url;
+    const layer = (p?.layers||[])[0];
+    const url = layer?.url;
     if (!url) continue;
 
     let plc = p.placement || 'front';
-    if (!spec[plc] && keys.length) plc = keys[0]; // mappe vers 1er placement valide
+    if (!spec[plc] && keys.length) plc = keys[0];
 
     let tech = String(p.technique || '').toLowerCase();
     const allowed = spec[plc] || deriveTechsFromKey(plc).map(x=>String(x).toLowerCase());
     if (!tech || !allowed.includes(tech)) tech = allowed[0];
 
-    const item = { placement: plc, technique: tech || undefined, layers: [{ type:'file', url: String(url).replace('ucarecd.net','ucarecdn.com') }] };
+    const filename = layer.filename || (()=>{ try{ const u=new URL(url); const parts=u.pathname.split('/').filter(Boolean); return parts[parts.length-1] || 'design.png'; }catch(_){ return 'design.png'; } })();
+
+    const item = {
+      placement: plc,
+      technique: tech || undefined,
+      layers: [{ type:'file', url: String(url).replace('ucarecd.net','ucarecdn.com'), filename }]
+    };
     const i = out.findIndex(x => x.placement === plc);
     if (i >= 0) out[i] = item; else out.push(item);
   }
   return out;
 }
+
+// ... le reste (ensureProductOptions, fillMissingPlacements, handler, etc.) inchangé ...
 
 // ---- options produit (booléens, valeurs autorisées, couture auto, lifelike masquée si non requise)
 function coerceBoolean(v){

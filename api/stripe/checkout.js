@@ -1,7 +1,4 @@
 // /api/stripe/checkout.js
-// Crée une session de paiement Stripe en sérialisant toutes les infos utiles en metadata.
-// Requiert STRIPE_SECRET_KEY en variable d'env.
-
 function cors(res){
   res.setHeader('Access-Control-Allow-Origin','*'); // restreins à ton domaine en prod
   res.setHeader('Vary','Origin');
@@ -33,7 +30,6 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'No items' });
     }
 
-    // Ligne(s) Stripe
     const line_items = items.map(it => ({
       quantity: Number(it.quantity || 1),
       price_data: {
@@ -46,7 +42,6 @@ module.exports = async (req, res) => {
       }
     }));
 
-    // On compacte le panier pour la metadata (mono-produit ici, mais compatible multi)
     const compactCart = items.map((it, idx) => ({
       i: idx,
       variant_id: Number(it.catalog_variant_id || it.variant_id || 0),
@@ -54,48 +49,37 @@ module.exports = async (req, res) => {
       options: it.options || []
     }));
 
-    // NB: Stripe metadata max ~ 500 chars par champ; on compacte et on stocke
-    const metadata = {
-      product_id: String(product_id || ''),
-      cart_json: JSON.stringify(compactCart) // le confirm reconstituera depuis ça
-    };
+    const params = new URLSearchParams({
+      mode: 'payment',
+      success_url,
+      cancel_url,
+      'shipping_options[0][shipping_rate_data][type]': 'fixed_amount',
+      'shipping_options[0][shipping_rate_data][display_name]': shipping.name || 'Livraison',
+      'shipping_options[0][shipping_rate_data][fixed_amount][amount]': String(Number(shipping.amount || 0)),
+      'shipping_options[0][shipping_rate_data][fixed_amount][currency]': currency,
+      'shipping_address_collection[allowed_countries][]': 'LU',
+      'shipping_address_collection[allowed_countries][]': 'FR',
+      'shipping_address_collection[allowed_countries][]': 'BE',
+      'shipping_address_collection[allowed_countries][]': 'DE',
+      'shipping_address_collection[allowed_countries][]': 'NL',
+      'metadata[product_id]': String(product_id || ''),
+      'metadata[cart_json]': JSON.stringify(compactCart)
+    });
+
+    line_items.forEach((li, idx) => {
+      params.append(`line_items[${idx}][quantity]`,               String(li.quantity));
+      params.append(`line_items[${idx}][price_data][currency]`,    li.price_data.currency);
+      params.append(`line_items[${idx}][price_data][unit_amount]`, String(li.price_data.unit_amount));
+      params.append(`line_items[${idx}][price_data][product_data][name]`, li.price_data.product_data.name);
+      (li.price_data.product_data.images||[]).slice(0,1).forEach((img,i)=>{
+        params.append(`line_items[${idx}][price_data][product_data][images][${i}]`, img);
+      });
+    });
 
     const resp = await fetch('https://api.stripe.com/v1/checkout/sessions', {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${SK}`,
-        'Content-Type': 'application/x-www-form-urlencoded'
-      },
-      body: new URLSearchParams({
-        mode: 'payment',
-        success_url,
-        cancel_url,
-        // Shipping (forfait)
-        'shipping_options[0][shipping_rate_data][type]': 'fixed_amount',
-        'shipping_options[0][shipping_rate_data][display_name]': shipping.name || 'Livraison',
-        'shipping_options[0][shipping_rate_data][fixed_amount][amount]': String(Number(shipping.amount || 0)),
-        'shipping_options[0][shipping_rate_data][fixed_amount][currency]': currency,
-        // On collecte adresse de livraison (utile pour Printful)
-        'shipping_address_collection[allowed_countries][]': 'LU',
-        'shipping_address_collection[allowed_countries][]': 'FR',
-        'shipping_address_collection[allowed_countries][]': 'BE',
-        'shipping_address_collection[allowed_countries][]': 'DE',
-        'shipping_address_collection[allowed_countries][]': 'NL',
-        // Items
-        ...Object.fromEntries(
-          line_items.flatMap((li, idx) => ([
-            [`line_items[${idx}][quantity]`,               String(li.quantity)],
-            [`line_items[${idx}][price_data][currency]`,    li.price_data.currency],
-            [`line_items[${idx}][price_data][unit_amount]`, String(li.price_data.unit_amount)],
-            [`line_items[${idx}][price_data][product_data][name]`, li.price_data.product_data.name],
-            ...((li.price_data.product_data.images||[]).slice(0,1).map((img, i) =>
-              [`line_items[${idx}][price_data][product_data][images][${i}]`, img]
-            ))
-          ]))
-        ),
-        // Metadata
-        ...Object.fromEntries(Object.entries(metadata).map(([k,v]) => [`metadata[${k}]`, String(v)]))
-      })
+      headers: { Authorization: `Bearer ${SK}`, 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params
     });
 
     const data = await resp.json();

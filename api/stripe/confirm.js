@@ -1,13 +1,8 @@
 // /api/stripe/confirm.js
-// Stripe -> lit metadata(cart_json) -> récupère schéma produit (via product_id ou via variant_id)
-// -> normalise placements/techniques (force techniques autorisées : cut-sew, dtfilm, embroidery, etc.)
-// -> assemble toutes les product_options requises dynamiquement (inclut stitch/seam/thread color)
-// -> crée + confirme la commande Printful v2, avec fallback si technique invalide détectée.
-
 const { createHash } = require('crypto');
 
 function cors(res){
-  res.setHeader('Access-Control-Allow-Origin','*'); // restreins à ton domaine en prod
+  res.setHeader('Access-Control-Allow-Origin','*'); // restreins en prod
   res.setHeader('Vary','Origin');
   res.setHeader('Access-Control-Allow-Methods','POST,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers','Content-Type, Authorization, X-Requested-With');
@@ -66,10 +61,10 @@ async function pfGetVariant(variantId, token, storeId){
   return j?.data || j;
 }
 
-// ---------- Utilitaires schéma
+// ---------- Utilitaires schéma & placements
 function collectAllOptions(schema){
   if (!schema) return [];
-  const keys = Object.keys(schema || {}).filter(k => /option/i.test(k)); // options, product_options, available_options...
+  const keys = Object.keys(schema || {}).filter(k => /option/i.test(k));
   const arrs = keys.map(k => Array.isArray(schema[k]) ? schema[k] : []).flat();
   return arrs.map(o => ({
     id: (o.id||o.code||o.name||'').toString(),
@@ -114,11 +109,7 @@ function normalisePlacements(incoming, spec){
 
     let tech = String(p.technique || '').toLowerCase();
     const allowed = spec[plc] || deriveTechsFromKey(plc).map(x=>String(x).toLowerCase());
-
-    if (!tech || !allowed.includes(tech)) {
-      // Ex: dtg -> cut-sew si c'est un cut&sew-only
-      tech = allowed[0];
-    }
+    if (!tech || !allowed.includes(tech)) tech = allowed[0];
 
     const item = { placement: plc, technique: tech || undefined, layers: [{ type:'file', url: String(url).replace('ucarecd.net','ucarecdn.com') }] };
     const i = out.findIndex(x => x.placement === plc);
@@ -147,20 +138,17 @@ function pickFirstValue(opt){
     if (vBlack) return (vBlack.value||vBlack);
     return (values[0].value||values[0]);
   }
-  return 'black'; // fallback sensé pour couleurs de fil
+  return 'black';
 }
 function ensureProductOptions(incoming, schema, placements){
-  // transforme ce qui vient du client (id/name,value) vers [{name,value}]
   const out = Array.isArray(incoming)
     ? incoming.map(o => ({ name: (o.name||o.id), value: o.value }))
     : [];
 
-  // Index des options déjà posées
   const has = n => out.find(x => String(x.name) === String(n));
-
   const all = collectAllOptions(schema);
 
-  // 1) Toujours poser les options "required" si absentes (valeur par défaut = 1ère valeur connue ou true)
+  // Required
   for (const opt of all){
     if (!opt.required) continue;
     if (has(opt.id)) continue;
@@ -168,10 +156,9 @@ function ensureProductOptions(incoming, schema, placements){
     out.push({ name: opt.id, value: def });
   }
 
-  // 2) Couture (stitch/seam/thread color) — ajouter si le schéma la liste OU si technique embroidery/cut&sew détectée
+  // Couture (stitch/seam/thread color)
   const stitchIds = findStitchLikeIds(schema);
   const needsByTechnique = Array.isArray(placements) && placements.some(p => /embro|cut[-_\s]?sew/i.test(p.technique||''));
-
   if (stitchIds.length){
     for (const id of stitchIds){
       if (!has(id)) {
@@ -183,7 +170,7 @@ function ensureProductOptions(incoming, schema, placements){
     out.push({ name:'stitch_color', value:'black' });
   }
 
-  // 3) Dédupe par name (le dernier gagne)
+  // Dédupe (le dernier gagne)
   const map = new Map();
   for (const o of out){ map.set(String(o.name), o.value); }
   return Array.from(map, ([name,value]) => ({ name, value }));
@@ -206,13 +193,13 @@ module.exports = async (req, res) => {
     const {session_id}=typeof req.body==='string'?JSON.parse(req.body):(req.body||{});
     if(!session_id) return res.status(400).json({ok:false,error:'Missing session_id'});
 
-    // 1) Stripe
+    // Stripe
     const session=await sget(`/checkout/sessions/${session_id}`,SK);
     if(session.payment_status!=='paid') return res.status(400).json({ok:false,error:'Payment not settled',payment_status:session.payment_status});
     const pi=session.payment_intent?await sget(`/payment_intents/${session.payment_intent}?expand[]=latest_charge`,SK):null;
     const charge=pi?.latest_charge||(pi?.charges?.data?.[0]||null);
 
-    // 2) Cart metadata
+    // Metadata cart
     const m = session.metadata || {};
     const productIdMeta = Number(m.product_id || 0);
     let cart=[]; try{ cart=JSON.parse(m.cart_json||'[]'); }catch(_){}
@@ -221,17 +208,17 @@ module.exports = async (req, res) => {
     const item = cart[0]; // mono-produit
     const variantId = Number(item?.variant_id || 0);
     let placements = item?.placements || [];
-    let options    = item?.options    || []; // client options (peuvent être vides)
+    let options    = item?.options    || [];
     if(!variantId) return res.status(400).json({ok:false,error:'Missing catalog_variant_id'});
 
-    // 3) Adresse
+    // Adresse
     const recipient = pickAddr({session,pi,charge});
     if(!recipient) return res.status(400).json({ok:false,error:'Missing or incomplete recipient address'});
 
-    // 4) external_id ≤ 32
+    // external_id ≤ 32
     const external_id='cs_'+createHash('sha256').update(session.id).digest('hex').slice(0,29);
 
-    // 5) Schéma produit (via product_id, sinon via variant → product)
+    // Schéma produit
     let productSchema=null;
     let productId = productIdMeta;
     try {
@@ -244,15 +231,15 @@ module.exports = async (req, res) => {
       }
     } catch(_) {}
 
-    // 6) Normalise placements/techniques avec liste autorisée (schema-first)
+    // Placements/techniques
     const spec = productSchema ? buildPlacementSpec(productSchema) : {};
     let normPlacements = normalisePlacements(placements, spec);
     if (!normPlacements.length) return res.status(400).json({ ok:false, error:'No design layers provided' });
 
-    // 7) Product options dynamiques (v2 = product_options [{name,value}])
+    // Product options dynamiques
     let product_options = ensureProductOptions(options, productSchema, normPlacements);
 
-    // 8) Payload v2
+    // Payload v2
     let orderPayload = {
       external_id,
       recipient,
@@ -265,7 +252,7 @@ module.exports = async (req, res) => {
       }]
     };
 
-    // 9) Create avec fallback si technique invalide (ex: "dtg one of: [cut-sew]")
+    // Create (+ fallback technique invalide)
     let created;
     try{
       created = await pfCreate(orderPayload, PF_TOKEN, PF_STORE_ID);
@@ -287,7 +274,7 @@ module.exports = async (req, res) => {
     const oid = created?.data?.id;
     if(!oid) return res.status(500).json({ok:false,error:'Printful returned no order id',details:created});
 
-    // 10) Confirm (retry si coût/design en cours)
+    // Confirm (retry)
     let confirmation=null;
     if(PF_CONFIRM){
       for(let i=0;i<12;i++){

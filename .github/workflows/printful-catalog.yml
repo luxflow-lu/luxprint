@@ -13,22 +13,12 @@ on:
         description: "Limite par page (défaut 100)"
         required: false
         default: "100"
-      rest_endpoints:
-        description: |
-          Endpoints REST à paginer (un par ligne). Tu peux ajouter/retirer.
-          Exemples:
-          /v2/catalog/categories
-          /v2/catalog/product-categories
-          /v2/countries
-          /v2/catalog/availability
-          /v2/catalog/prices
+      rest_endpoints_csv:
+        description: >
+          Endpoints REST à paginer séparés par des virgules.
+          Exemple: /v2/catalog/categories,/v2/catalog/product-categories,/v2/countries,/v2/catalog/availability,/v2/catalog/prices
         required: false
-        default: |
-          /v2/catalog/categories
-          /v2/catalog/product-categories
-          /v2/countries
-          /v2/catalog/availability
-          /v2/catalog/prices
+        default: "/v2/catalog/categories,/v2/catalog/product-categories,/v2/countries,/v2/catalog/availability,/v2/catalog/prices"
 
 env:
   BASE_URL: "https://api.printful.com"
@@ -47,7 +37,7 @@ jobs:
           PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}   # <- ton secret existant
           PAGE_LIMIT: ${{ inputs.page_limit }}
           BASE_URL: ${{ env.BASE_URL }}
-          REST_ENDPOINTS: ${{ inputs.rest_endpoints }}
+          REST_ENDPOINTS_CSV: ${{ inputs.rest_endpoints_csv }}
 
       - name: Upload CSV artifacts (REST)
         uses: actions/upload-artifact@v4
@@ -66,7 +56,7 @@ jobs:
       - name: Run CORE script (paginated + checkpoint)
         run: node scripts/core/run_core.mjs
         env:
-          PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}   # <- ton secret existant
+          PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}
           PAGE_LIMIT: ${{ inputs.page_limit }}
           BASE_URL: ${{ env.BASE_URL }}
 

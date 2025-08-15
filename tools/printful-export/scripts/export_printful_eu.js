@@ -97,6 +97,24 @@ async function listAllProducts({ region, dest, max = 200 }) {
   return all;
 }
 
+async function fetchVariantsForProduct(pid) {
+  const PAGE_LIMIT = 100;
+  let offset = 0, all = [];
+  while (true) {
+    const url = `${API_BASE}/v2/catalog-products/${pid}/catalog-variants?limit=${PAGE_LIMIT}&offset=${offset}`;
+    const vj = await getJSON(url);
+    const data = vj?.result || vj?.data || vj || {};
+    const list = data.items || data || [];
+    if (!Array.isArray(list) || list.length === 0) break;
+    all.push(...list);
+    offset += list.length;
+    if ((data.total && offset >= data.total) || list.length < PAGE_LIMIT) break;
+    await sleep(120);
+  }
+  return all;
+}
+
+
 
 async function main() {
   console.log('Export Printful → CSV');
@@ -208,22 +226,14 @@ async function main() {
       }
     } catch (_) {}
 
-    // Variants
-    let vlist = [];
-    try {
-      const vj = await getJSON(`${API_BASE}/v2/catalog-products/${pid}/catalog-variants`);
-      vlist = (vj?.result || vj?.data || vj || []);
-      vlist = vlist.items || vlist || [];
-    } catch (_) { vlist = []; }
+// Variants (paged)
+let vlist = [];
+try {
+  vlist = await fetchVariantsForProduct(pid);
+} catch (_) {
+  vlist = [];
+}
 
-    for (const v of vlist) {
-      const vid = v?.id; if (!vid) continue;
-
-      let vd = v;
-      try {
-        const d = await getJSON(`${API_BASE}/v2/catalog-variants/${vid}`);
-        vd = d?.result || d?.data || d || vd;
-      } catch (_) {}
 
       variantsRows.push({
         catalog_variant_id: vid,

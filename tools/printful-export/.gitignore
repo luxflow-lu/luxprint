@@ -1,4 +1,4 @@
-# never commit secrets or large exports
+# local only
 .env
 printful_export/
 *.zip

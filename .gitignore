@@ -1,0 +1,5 @@
+# never commit secrets or large exports
+.env
+printful_export/
+*.zip
+node_modules/

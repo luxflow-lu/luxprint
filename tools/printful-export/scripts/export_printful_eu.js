@@ -29,26 +29,41 @@ fs.mkdirSync(OUTDIR, { recursive: true });
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Generic GET with retries/backoff
+/**
+ * GET JSON with retries/backoff.
+ * - Respect `Retry-After` header (seconds → ms)
+ * - Progressive backoff with jitter
+ */
 async function getJSON(url, { retry = 5, backoff = 800 } = {}) {
   for (let a = 1; a <= retry; a++) {
     let r = null;
     try {
       r = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
     } catch (_) {}
+
     if (!r) {
       if (a === retry) throw new Error(`Fetch failed: ${url}`);
-      await sleep(backoff * a); continue;
+      const ms = backoff * a;
+      if (DEBUG) console.log(`[retry] network wait=${ms}ms ${url}`);
+      await sleep(ms);
+      continue;
     }
+
+    // 429 or 5xx → respect Retry-After (seconds) and ensure ms >= backoff*a
     if (r.status === 429 || (r.status >= 500 && r.status <= 599)) {
-      const ra = Number(r.headers.get('retry-after')) || backoff * a;
+      const raHeader = r.headers.get('retry-after');
+      let raMs = raHeader ? Number(raHeader) * 1000 : backoff * a; // convert seconds → ms
+      if (!Number.isFinite(raMs) || raMs <= 0) raMs = backoff * a;
+      raMs = Math.max(raMs, backoff * a) + Math.floor(Math.random() * 250); // floor + jitter
       if (a === retry) {
         const t = await r.text().catch(() => '');
         throw new Error(`HTTP ${r.status} ${url} :: ${t}`);
       }
-      if (DEBUG) console.log(`[retry] ${r.status} wait=${ra}ms ${url}`);
-      await sleep(ra); continue;
+      if (DEBUG) console.log(`[retry] ${r.status} wait=${raMs}ms ${url}`);
+      await sleep(raMs);
+      continue;
     }
+
     if (!r.ok) {
       const t = await r.text().catch(() => '');
       throw new Error(`HTTP ${r.status}: ${url} :: ${t}`);

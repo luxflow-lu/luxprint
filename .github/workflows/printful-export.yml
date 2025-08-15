@@ -43,13 +43,14 @@ jobs:
             exit 1
           fi
 
-      - name: Run exporter
+      - name: Run exporter (full)
         env:
           PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN || vars.PRINTFUL_TOKEN }}
         run: |
           node scripts/export_printful_eu.js \
             ${{ github.event.inputs.dest && format('--dest {0}', github.event.inputs.dest) || format('--region {0}', github.event.inputs.region) }} \
-            --max ${{ github.event.inputs.max }} --zip
+            --max ${{ github.event.inputs.max }} --zip --debug
+
 
       - name: List outputs
         run: ls -la printful_export || true

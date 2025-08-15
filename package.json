@@ -1,11 +1,4 @@
-{
-  "name": "luxprint-api",
-  "private": true,
-  "engines": { "node": ">=18" },
-  "dependencies": {
-    "stripe": "^14.0.0"
-  }
-}
+
 
 
 {

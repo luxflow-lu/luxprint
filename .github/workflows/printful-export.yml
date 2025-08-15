@@ -4,14 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       region:
-        description: "selling_region_name (ex: europe)"
+        description: "selling_region_name (ex: europe) — ignoré si dest est défini"
         required: false
         default: "europe"
       dest:
-        description: "destination_country (ex: FR) — si présent, remplace region"
+        description: "destination_country (ex: FR) — prioritaire sur region"
         required: false
       max:
-        description: "Nombre max de produits"
+        description: "Nombre max de produits à exporter"
         required: true
         default: "300"
 
@@ -21,24 +21,40 @@ jobs:
     defaults:
       run:
         working-directory: tools/printful-export
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
-      - run: npm ci || npm i
+      - name: Install deps
+        run: npm ci || npm i
+
+      - name: Check token (secret or variable)
+        env:
+          TOKEN: ${{ secrets.PRINTFUL_TOKEN || vars.PRINTFUL_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error ::PRINTFUL_TOKEN is missing. Add it in Settings → Secrets (preferred) or Variables."
+            exit 1
+          fi
 
       - name: Run exporter
         env:
-          PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}
+          PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN || vars.PRINTFUL_TOKEN }}
         run: |
           node scripts/export_printful_eu.js \
             ${{ github.event.inputs.dest && format('--dest {0}', github.event.inputs.dest) || format('--region {0}', github.event.inputs.region) }} \
             --max ${{ github.event.inputs.max }} --zip
 
-      - name: Upload artifact
+      - name: List outputs
+        run: ls -la printful_export || true
+
+      - name: Upload artifact (CSV + ZIP)
         uses: actions/upload-artifact@v4
         with:
           name: luxprint-export-${{ github.run_id }}

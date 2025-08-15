@@ -1,14 +1,11 @@
-// CORE: products + variants (lourd), pagination auto (limit=PAGE_LIMIT, offset++)
-// Checkpoints pour reprendre en cas de rate-limit.
+// CORE: products + variants (lourd), pagination auto (limit=PAGE_LIMIT, offset++), checkpoints.
+// Secret: PRINTFUL_TOKEN
 
 import fs from "node:fs";
 import path from "node:path";
 
 const API_KEY = process.env.PRINTFUL_TOKEN;
-if (!API_KEY) {
-  console.error("Missing PRINTFUL_TOKEN in env.");
-  process.exit(1);
-}
+if (!API_KEY) { console.error("Missing PRINTFUL_TOKEN in env."); process.exit(1); }
 const BASE_URL = (process.env.BASE_URL || "https://api.printful.com").replace(/\/+$/, "");
 const LIMIT = parseInt(process.env.PAGE_LIMIT || "100", 10);
 
@@ -17,7 +14,7 @@ const CKPT_DIR = path.resolve(".checkpoints");
 fs.mkdirSync(OUT_DIR, { recursive: true });
 fs.mkdirSync(CKPT_DIR, { recursive: true });
 
-const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-core/1.3" };
+const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-core/1.4" };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function fetchJsonWithRetry(url, maxRetries = 8, backoffBase = 1000) {

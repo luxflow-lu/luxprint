@@ -15,17 +15,17 @@ on:
         default: "100"
       rest_endpoints_csv:
         description: >
-          Endpoints REST à paginer séparés par des virgules.
-          Exemple: /v2/catalog/categories,/v2/catalog/product-categories,/v2/countries,/v2/catalog/availability,/v2/catalog/prices
+          Endpoints REST à paginer (hors products/variants), séparés par des virgules.
+          Laisse vide pour utiliser la grosse liste par défaut.
         required: false
-        default: "/v2/catalog/categories,/v2/catalog/product-categories,/v2/countries,/v2/catalog/availability,/v2/catalog/prices"
+        default: ""
 
 env:
   BASE_URL: "https://api.printful.com"
 
 jobs:
   rest:
-    name: REST (multi-collections + product_images)
+    name: REST (toutes les collections catalogue hors products/variants) + images & availability
     if: ${{ inputs.part == 'rest' || inputs.part == 'both' }}
     runs-on: ubuntu-latest
     steps:
@@ -34,7 +34,7 @@ jobs:
       - name: Run REST script (paginated)
         run: node scripts/rest/run_rest.mjs
         env:
-          PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}   # <- ton secret existant
+          PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}
           PAGE_LIMIT: ${{ inputs.page_limit }}
           BASE_URL: ${{ env.BASE_URL }}
           REST_ENDPOINTS_CSV: ${{ inputs.rest_endpoints_csv }}

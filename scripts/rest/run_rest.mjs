@@ -1,7 +1,8 @@
-// REST: endpoints multiples (config via REST_ENDPOINTS) + product_images
+// REST: endpoints multiples (config via REST_ENDPOINTS_CSV) + product_images
 // - Pagine (limit=PAGE_LIMIT, offset++) pour chaque endpoint déclaré
 // - Génère 1 CSV par endpoint (nom basé sur le chemin), + product_images.csv
-// - Peut tourner AVANT CORE : si variants.csv absent, on pagine /catalog/variants pour les images
+// - Peut tourner AVANT CORE : si variants.csv absent, on pagine /catalog/variants pour récupérer les images
+// - Tolérant aux 404 : on log, on écrit un CSV vide, et on continue.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -16,24 +17,29 @@ const LIMIT = parseInt(process.env.PAGE_LIMIT || "100", 10);
 const OUT_DIR = path.resolve("data");
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
-const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-rest/1.2" };
+const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-rest/1.3" };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-function normalizeListFromEnv(name, def) {
-  const raw = (process.env[name] ?? "").trim();
-  if (!raw) return def;
-  return raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+function parseEndpoints() {
+  // 1) CSV depuis l'input du workflow
+  const csv = (process.env.REST_ENDPOINTS_CSV ?? "").trim();
+  if (csv) {
+    let list = csv.split(/[,;\s]+/).map(s => s.trim()).filter(Boolean);
+    // Cas GitHub qui colle tout: "/v2/a/v2/b/v2/c..."
+    if (list.length <= 1 && csv.includes("/v2/")) {
+      list = csv.split(/(?=\/v2\/)/g).map(s => s.trim()).filter(Boolean);
+    }
+    return list;
+  }
+  // 2) Fallback (très peu probable)
+  return [
+    "/v2/catalog/categories",
+    "/v2/catalog/product-categories",
+    "/v2/countries",
+    "/v2/catalog/availability",
+    "/v2/catalog/prices",
+  ];
 }
-
-// Endpoints REST à paginer (défaut inclut prices)
-const DEFAULT_ENDPOINTS = [
-  "/v2/catalog/categories",
-  "/v2/catalog/product-categories",
-  "/v2/countries",
-  "/v2/catalog/availability",
-  "/v2/catalog/prices"
-];
-const REST_ENDPOINTS = normalizeListFromEnv("REST_ENDPOINTS", DEFAULT_ENDPOINTS);
 
 async function fetchJsonWithRetry(url, maxRetries = 8, backoffBase = 1000) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -154,8 +160,10 @@ async function* iterateVariantIds(limit) {
 
 (async () => {
   try {
-    // 1) Endpoints REST dynamiques
-    for (const ep of REST_ENDPOINTS) {
+    // 1) Endpoints REST dynamiques (tolérant aux erreurs)
+    const endpoints = parseEndpoints();
+    console.log("REST endpoints:", endpoints.join(", "));
+    for (const ep of endpoints) {
       try {
         const rows = await pagedFetch(ep, LIMIT);
         const outName = endpointToCsvName(ep);
@@ -168,27 +176,33 @@ async function* iterateVariantIds(limit) {
     }
 
     // 2) Product images (fonctionne même si CORE pas encore lancé)
-    const pimgOut = path.join(OUT_DIR, "product_images.csv");
-    const images_rows = [];
-    const vcsv = variantsCsvPath();
+    try {
+      const pimgOut = path.join(OUT_DIR, "product_images.csv");
+      const images_rows = [];
+      const vcsv = variantsCsvPath();
 
-    if (vcsv) {
-      let count = 0;
-      for (const vid of readCsvIds(vcsv)) {
-        const imgs = await fetchVariantImages(vid);
-        images_rows.push(...imgs);
-        if (++count % 250 === 0) console.log(`...fetched images for ${count} variants`);
+      if (vcsv) {
+        let count = 0;
+        for (const vid of readCsvIds(vcsv)) {
+          const imgs = await fetchVariantImages(vid);
+          images_rows.push(...imgs);
+          if (++count % 250 === 0) console.log(`...fetched images for ${count} variants`);
+        }
+      } else {
+        let count = 0;
+        for await (const vid of iterateVariantIds(LIMIT)) {
+          const imgs = await fetchVariantImages(vid);
+          images_rows.push(...imgs);
+          if (++count % 250 === 0) console.log(`...fetched images for ${count} variants (REST pre-core)`);
+        }
       }
-    } else {
-      let count = 0;
-      for await (const vid of iterateVariantIds(LIMIT)) {
-        const imgs = await fetchVariantImages(vid);
-        images_rows.push(...imgs);
-        if (++count % 250 === 0) console.log(`...fetched images for ${count} variants (REST pre-core)`);
-      }
+
+      writeCsv(pimgOut, images_rows);
+    } catch (e) {
+      console.warn("Warn: product_images step failed — writing empty CSV.", e?.message || e);
+      writeCsv(path.join(OUT_DIR, "product_images.csv"), []);
     }
 
-    writeCsv(pimgOut, images_rows);
     console.log("REST done.");
   } catch (e) {
     console.error("REST failed:", e?.message || e);

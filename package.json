@@ -6,3 +6,20 @@
     "stripe": "^14.0.0"
   }
 }
+
+
+{
+  "name": "luxprint-export",
+  "version": "1.0.0",
+  "description": "Printful catalog exporter for Webflow (LuxPrint)",
+  "type": "commonjs",
+  "scripts": {
+    "export:eu": "node scripts/export_printful_eu.js --region europe --max 300 --zip",
+    "export:fr": "node scripts/export_printful_eu.js --dest FR --max 300 --zip"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "jszip": "^3.10.1"
+  },
+  "engines": { "node": ">=18" }
+}

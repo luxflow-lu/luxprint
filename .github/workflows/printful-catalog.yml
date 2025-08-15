@@ -8,46 +8,52 @@ on:
         type: choice
         required: true
         default: rest
-        options:
-          - rest
-          - core
-          - both
+        options: [rest, core, both]
       page_limit:
         description: "Limite par page (défaut 100)"
         required: false
         default: "100"
+      rest_endpoints:
+        description: |
+          Endpoints REST à paginer (un par ligne). Tu peux ajouter/retirer.
+          Exemples:
+          /v2/catalog/categories
+          /v2/catalog/product-categories
+          /v2/countries
+          /v2/catalog/availability
+          /v2/catalog/prices
+        required: false
+        default: |
+          /v2/catalog/categories
+          /v2/catalog/product-categories
+          /v2/countries
+          /v2/catalog/availability
+          /v2/catalog/prices
 
 env:
-  PRINTFUL_API_KEY: ${{ secrets.PRINTFUL_API_KEY }}
-  PAGE_LIMIT: ${{ inputs.page_limit }}
   BASE_URL: "https://api.printful.com"
 
 jobs:
   rest:
-    name: REST (categories, product_categories, countries, availability, product_images*)
+    name: REST (multi-collections + product_images)
     if: ${{ inputs.part == 'rest' || inputs.part == 'both' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Run REST script (paginated)
-        run: |
-          node scripts/rest/run_rest.mjs
+        run: node scripts/rest/run_rest.mjs
         env:
-          PRINTFUL_TOKEN: ${{ env.PRINTFUL_TOKEN }}
-          PAGE_LIMIT: ${{ env.PAGE_LIMIT }}
+          PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}   # <- ton secret existant
+          PAGE_LIMIT: ${{ inputs.page_limit }}
           BASE_URL: ${{ env.BASE_URL }}
+          REST_ENDPOINTS: ${{ inputs.rest_endpoints }}
 
       - name: Upload CSV artifacts (REST)
         uses: actions/upload-artifact@v4
         with:
           name: csv-rest
-          path: |
-            data/categories.csv
-            data/product_categories.csv
-            data/countries.csv
-            data/availability.csv
-            data/product_images.csv
+          path: data/*.csv
           if-no-files-found: warn
 
   core:
@@ -57,12 +63,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run CORE script (paginated)
-        run: |
-          node scripts/core/run_core.mjs
+      - name: Run CORE script (paginated + checkpoint)
+        run: node scripts/core/run_core.mjs
         env:
-          PRINTFUL_API_KEY: ${{ env.PRINTFUL_API_KEY }}
-          PAGE_LIMIT: ${{ env.PAGE_LIMIT }}
+          PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}   # <- ton secret existant
+          PAGE_LIMIT: ${{ inputs.page_limit }}
           BASE_URL: ${{ env.BASE_URL }}
 
       - name: Upload CSV artifacts (CORE)

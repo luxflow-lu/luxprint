@@ -1,0 +1,15 @@
+{
+  "name": "luxprint",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "",
+    "start": "node server.js || echo \"No server.js (Vercel functions only)\""
+  },
+  "dependencies": {
+    "stripe": "^14.0.0"
+  }
+}

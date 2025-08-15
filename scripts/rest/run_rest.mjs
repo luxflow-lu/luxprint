@@ -7,9 +7,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const API_KEY = process.env.PRINTFUL_API_KEY;
+const API_KEY = process.env.PRINTFUL_TOKEN;
 if (!API_KEY) {
-  console.error("Missing PRINTFUL_API_KEY in env.");
+  console.error("Missing PRINTFUL_TOKEN in env.");
   process.exit(1);
 }
 const BASE_URL = (process.env.BASE_URL || "https://api.printful.com").replace(/\/+$/, "");

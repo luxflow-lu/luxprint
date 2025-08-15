@@ -1,0 +1,40 @@
+name: Printful Export
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: selling_region_name (ex: europe)
+        required: false
+        default: europe
+      dest:
+        description: destination_country (ex: FR) — overrides region if set
+        required: false
+      max:
+        description: Max products
+        required: true
+        default: "300"
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/printful-export
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+      - run: npm ci || npm i
+      - name: Run exporter
+        env: { PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }} }
+        run: |
+          node scripts/export_printful_eu.js \
+            ${{ github.event.inputs.dest && format('--dest {0}', github.event.inputs.dest) || format('--region {0}', github.event.inputs.region) }} \
+            --max ${{ github.event.inputs.max }} --zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luxprint-export-${{ github.run_id }}
+          path: |
+            tools/printful-export/printful_export/*.csv
+            tools/printful-export/printful_export/*.zip

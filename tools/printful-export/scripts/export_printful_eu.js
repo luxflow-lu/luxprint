@@ -69,28 +69,34 @@ function writeCSV(name, rows, headers = null) {
 }
 
 async function listAllProducts({ region, dest, max = 200 }) {
+  const PAGE_LIMIT = 100; // Printful v2 accepte 1..100
   const params = new URLSearchParams();
   if (dest) params.set('destination_country', dest);
   else if (region) params.set('selling_region_name', region);
-  params.set('limit', '200');
+  params.set('limit', String(PAGE_LIMIT));
+
   let offset = 0, all = [];
   while (true) {
     params.set('offset', String(offset));
     const j = await getJSON(`${API_BASE}/v2/catalog-products?${params.toString()}`);
     const data = j?.result || j?.data || j || {};
     const list = data.items || data.products || data || [];
-    if (!Array.isArray(list) || !list.length) break;
+
+    if (!Array.isArray(list) || list.length === 0) break;
+
     for (const it of list) {
       all.push(it);
-      if (max && all.length >= max) return all;
+      if (max && all.length >= max) return all; // respect --max
     }
+
     offset += list.length;
-    if (data.total && offset >= data.total) break;
-    if (list.length < 200) break;
-    await sleep(150); // douceur anti-rate limit
+    if ((data.total && offset >= data.total) || list.length < PAGE_LIMIT) break;
+
+    await sleep(150); // anti rate-limit
   }
   return all;
 }
+
 
 async function main() {
   console.log('Export Printful → CSV');

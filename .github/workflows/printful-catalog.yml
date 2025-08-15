@@ -1,0 +1,75 @@
+name: Printful Catalog Split Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      part:
+        description: "Choisir la partie à lancer"
+        type: choice
+        required: true
+        default: rest
+        options:
+          - rest
+          - core
+          - both
+      page_limit:
+        description: "Limite par page (défaut 100)"
+        required: false
+        default: "100"
+
+env:
+  PRINTFUL_API_KEY: ${{ secrets.PRINTFUL_API_KEY }}
+  PAGE_LIMIT: ${{ inputs.page_limit }}
+  BASE_URL: "https://api.printful.com"
+
+jobs:
+  rest:
+    name: REST (categories, product_categories, countries, availability, product_images*)
+    if: ${{ inputs.part == 'rest' || inputs.part == 'both' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run REST script (paginated)
+        run: |
+          node scripts/rest/run_rest.mjs
+        env:
+          PRINTFUL_API_KEY: ${{ env.PRINTFUL_API_KEY }}
+          PAGE_LIMIT: ${{ env.PAGE_LIMIT }}
+          BASE_URL: ${{ env.BASE_URL }}
+
+      - name: Upload CSV artifacts (REST)
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv-rest
+          path: |
+            data/categories.csv
+            data/product_categories.csv
+            data/countries.csv
+            data/availability.csv
+            data/product_images.csv
+          if-no-files-found: warn
+
+  core:
+    name: CORE (products, variants)
+    if: ${{ inputs.part == 'core' || inputs.part == 'both' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run CORE script (paginated)
+        run: |
+          node scripts/core/run_core.mjs
+        env:
+          PRINTFUL_API_KEY: ${{ env.PRINTFUL_API_KEY }}
+          PAGE_LIMIT: ${{ env.PAGE_LIMIT }}
+          BASE_URL: ${{ env.BASE_URL }}
+
+      - name: Upload CSV artifacts (CORE)
+        uses: actions/upload-artifact@v4
+        with:
+          name: csv-core
+          path: |
+            data/products.csv
+            data/variants.csv
+          if-no-files-found: warn

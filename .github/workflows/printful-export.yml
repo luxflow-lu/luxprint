@@ -11,13 +11,30 @@ on:
         description: "destination_country (ex: FR) — prioritaire sur region"
         required: false
       max:
-        description: "Nombre max de produits à exporter"
+        description: "0 = pas de limite (max-run)"
+        required: true
+        default: "0"
+      delay:
+        description: "Délai global après chaque requête OK (ms)"
         required: true
         default: "300"
+      retry:
+        description: "Nombre de tentatives sur 429/5xx"
+        required: true
+        default: "10"
+      backoff:
+        description: "Backoff de base (ms)"
+        required: true
+        default: "1000"
+      no_images:
+        description: "true pour sauter les images (run plus rapide)"
+        required: false
+        default: "false"
 
 jobs:
   export:
     runs-on: ubuntu-latest
+    timeout-minutes: 360   # 6h pour un run complet
     defaults:
       run:
         working-directory: tools/printful-export
@@ -43,17 +60,21 @@ jobs:
             exit 1
           fi
 
-      - name: Run exporter (full)
+      - name: Run exporter (max-run)
         env:
           PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN || vars.PRINTFUL_TOKEN }}
         run: |
+          EXTRA=""
+          if [ "${{ github.event.inputs.no_images }}" = "true" ]; then
+            EXTRA="--no-images"
+          fi
           node scripts/export_printful_eu.js \
             ${{ github.event.inputs.dest && format('--dest {0}', github.event.inputs.dest) || format('--region {0}', github.event.inputs.region) }} \
-            --max ${{ github.event.inputs.max }} --zip --debug
-
-
-      - name: List outputs
-        run: ls -la printful_export || true
+            --max ${{ github.event.inputs.max }} --zip --debug \
+            --delay ${{ github.event.inputs.delay }} \
+            --retry ${{ github.event.inputs.retry }} \
+            --backoff ${{ github.event.inputs.backoff }} \
+            $EXTRA
 
       - name: Upload artifact (CSV + ZIP)
         uses: actions/upload-artifact@v4

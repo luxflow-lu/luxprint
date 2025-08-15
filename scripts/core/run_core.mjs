@@ -1,5 +1,5 @@
 // CORE: products + variants (lourd), pagination auto (limit=PAGE_LIMIT, offset++)
-// Peut être lancé après REST. Checkpoints pour reprendre en cas de rate-limit.
+// Checkpoints pour reprendre en cas de rate-limit.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -17,7 +17,7 @@ const CKPT_DIR = path.resolve(".checkpoints");
 fs.mkdirSync(OUT_DIR, { recursive: true });
 fs.mkdirSync(CKPT_DIR, { recursive: true });
 
-const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-core/1.2" };
+const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-core/1.3" };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 async function fetchJsonWithRetry(url, maxRetries = 8, backoffBase = 1000) {

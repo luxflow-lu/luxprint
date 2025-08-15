@@ -1,0 +1,3 @@
+tools/printful-export/.env
+tools/printful-export/printful_export/
+tools/printful-export/node_modules/

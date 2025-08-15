@@ -17,31 +17,27 @@ function arg(name, def = null) {
   return i >= 0 ? (argv[i + 1] ?? true) : def;
 }
 
-// ====== RÉGLAGES POUR RUN LONG ET STABLE ======
-const REGION      = arg('region', 'europe');    // selling_region_name (ex: "europe")
-const DEST        = arg('dest', null);          // destination_country (ex: "FR"); si présent, override region
-const MAX         = Number(arg('max', 0));      // 0 = pas de limite produits (MAX RUN)
+// ====== Réglages ======
+const REGION      = arg('region', 'europe');      // selling_region_name
+const DEST        = arg('dest', null);            // destination_country (prioritaire)
+const MAX         = Number(arg('max', 0));        // 0 = pas de limite (max-run)
 const OUTDIR      = arg('out', 'printful_export');
-const WANT_ZIP    = argv.includes('--zip');     // nécessite jszip
-const DEBUG       = argv.includes('--debug');   // logs de progression
-const LITE        = argv.includes('--lite');    // saute images/prix/dispo/tailles (pour tests rapides)
-const SKIP_IMAGES = argv.includes('--no-images'); // pour alléger si besoin (garde prix/dispo/tailles)
-const DELAY       = Number(arg('delay', 300));  // délai global après chaque requête OK (ms) — par défaut 300ms
-const MAX_RETRY   = Number(arg('retry', 10));   // nb de tentatives sur 429/5xx
-const BASE_BACKOFF= Number(arg('backoff', 1000)); // backoff de base (ms) — sera multiplié par l’essai
+const WANT_ZIP    = argv.includes('--zip');       // nécessite jszip
+const DEBUG       = argv.includes('--debug');     // logs de progression
+const LITE        = argv.includes('--lite');      // saute images/prix/dispo/tailles (test rapide)
+const SKIP_IMAGES = argv.includes('--no-images'); // saute les images (si besoin d’alléger)
+const DELAY       = Number(arg('delay', 300));    // délai global post-réussite (ms)
+const MAX_RETRY   = Number(arg('retry', 10));     // nb de tentatives 429/5xx
+const BASE_BACKOFF= Number(arg('backoff', 1000)); // backoff de base (ms)
 
 fs.mkdirSync(OUTDIR, { recursive: true });
-
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// GET JSON avec retries/backoff + respect Retry-After (secondes ou date HTTP)
+/** GET JSON avec retries/backoff + respect Retry-After (sec/date) */
 async function getJSON(url, { retry = MAX_RETRY, backoff = BASE_BACKOFF } = {}) {
   for (let a = 1; a <= retry; a++) {
     let r = null;
-    try {
-      r = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } });
-    } catch (_) {}
-
+    try { r = await fetch(url, { headers: { Authorization: `Bearer ${TOKEN}` } }); } catch (_) {}
     if (!r) {
       if (a === retry) throw new Error(`Fetch failed: ${url}`);
       const ms = backoff * a;
@@ -56,7 +52,7 @@ async function getJSON(url, { retry = MAX_RETRY, backoff = BASE_BACKOFF } = {}) 
       if (raHeader) {
         const num = Number(raHeader);
         if (Number.isFinite(num) && num > 0) {
-          raMs = Math.max(raMs, num * 1000); // header en secondes → ms
+          raMs = Math.max(raMs, num * 1000); // sec → ms
         } else {
           const date = Date.parse(raHeader);
           if (Number.isFinite(date)) {
@@ -79,9 +75,8 @@ async function getJSON(url, { retry = MAX_RETRY, backoff = BASE_BACKOFF } = {}) 
       const t = await r.text().catch(() => '');
       throw new Error(`HTTP ${r.status}: ${url} :: ${t}`);
     }
-
     const json = await r.json();
-    if (DELAY > 0) await sleep(DELAY); // lissage global post-réussite
+    if (DELAY > 0) await sleep(DELAY); // lissage global
     return json;
   }
 }
@@ -121,11 +116,9 @@ async function listAllProducts({ region, dest, max = 0 }) {
 
     all.push(...list);
     if (DEBUG) console.log(`[page] products offset=${offset} got=${list.length} total=${all.length}`);
+    if (max && all.length >= max) return all.slice(0, max); // max=0 → illimité
 
-    // max=0 → pas de limite
-    if (max && all.length >= max) return all.slice(0, max);
     offset += list.length;
-
     if ((data.total && offset >= data.total) || list.length < PAGE_LIMIT) break;
     await sleep(150);
   }
@@ -222,7 +215,7 @@ async function main() {
       _links_variants: pd?._links?.variants?.href || '',
       _links_categories: pd?._links?.categories?.href || '',
       _links_prices: pd?._links?.product_prices?.href || '',
-      __links_sizes: pd?._links?.product_sizes?.href || '',
+      _links_sizes: pd?._links?.product_sizes?.href || '',
       _links_images: pd?._links?.product_images?.href || '',
       _links_availability: pd?._links?.availability?.href || ''
     });
@@ -295,19 +288,14 @@ async function main() {
 
     // variants (paged)
     let vlist = [];
-    try {
-      vlist = await fetchVariantsForProduct(pid);
-    } catch (_) {
-      vlist = [];
-    }
+    try { vlist = await fetchVariantsForProduct(pid); } catch (_) { vlist = []; }
 
     for (const v of vlist) {
       const vid = v?.id;
       if (!vid) continue;
-
       if (DEBUG) console.log(`  [variant] ${vid}`);
 
-      // variant detail (light)
+      // variant detail
       let vd = v;
       try {
         const d = await getJSON(`${API_BASE}/v2/catalog-variants/${vid}`);
@@ -331,7 +319,6 @@ async function main() {
       });
 
       if (!LITE && !SKIP_IMAGES) {
-        // variant images
         try {
           const iv = await getJSON(`${API_BASE}/v2/catalog-variants/${vid}/images`);
           const arr = iv?.result || iv?.data || iv || [];
@@ -348,7 +335,6 @@ async function main() {
       }
 
       if (!LITE) {
-        // variant prices
         try {
           const u = new URL(`${API_BASE}/v2/catalog-variants/${vid}/variant_prices`);
           if (REGION) u.searchParams.set('region', REGION);
@@ -364,7 +350,6 @@ async function main() {
           }
         } catch (_) {}
 
-        // availability
         try {
           const av = await getJSON(`${API_BASE}/v2/catalog-variants/${vid}/availability`);
           const items = av?.result || av?.data || av || [];
@@ -383,7 +368,7 @@ async function main() {
       }
     }
 
-    await sleep(120); // anti rafale entre produits
+    await sleep(120); // anti-rafale entre produits
   }
 
   // Dédup
@@ -421,17 +406,11 @@ async function main() {
   writeCSV('countries.csv', countriesDedup, ['code','name']);
 
   if (WANT_ZIP) {
-    let JSZip;
-    try { JSZip = require('jszip'); }
-    catch (e) {
-      console.warn('jszip not installed. Run: npm i jszip');
-      return;
-    }
+    let JSZip; try { JSZip = require('jszip'); }
+    catch (e) { console.warn('jszip not installed. Run: npm i jszip'); return; }
     const zip = new JSZip();
     const files = fs.readdirSync(OUTDIR).filter(f => f.endsWith('.csv'));
-    for (const f of files) {
-      zip.file(f, fs.readFileSync(path.join(OUTDIR, f), 'utf8'));
-    }
+    for (const f of files) zip.file(f, fs.readFileSync(path.join(OUTDIR, f), 'utf8'));
     const blob = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
     const zipName = `luxprint_export_${DEST || REGION}_${MAX || 'ALL'}${LITE ? '_lite' : ''}.zip`;
     fs.writeFileSync(path.join(OUTDIR, zipName), blob);

@@ -1,9 +1,8 @@
-// REST: categories, product_categories, countries, availability, product_images*
-// Pagination auto (limit=PAGE_LIMIT, offset++). Peut s'exécuter AVANT CORE.
-// * product_images :
-//    - si data/variants.csv existe -> lit les IDs et récupère les images.
-//    - sinon -> pagine /v2/catalog/variants (IDs) pour récupérer les images.
-//
+// REST: endpoints multiples (config via REST_ENDPOINTS) + product_images
+// - Pagine (limit=PAGE_LIMIT, offset++) pour chaque endpoint déclaré
+// - Génère 1 CSV par endpoint (nom basé sur le chemin), + product_images.csv
+// - Peut tourner AVANT CORE : si variants.csv absent, on pagine /catalog/variants pour les images
+
 import fs from "node:fs";
 import path from "node:path";
 
@@ -14,16 +13,27 @@ if (!API_KEY) {
 }
 const BASE_URL = (process.env.BASE_URL || "https://api.printful.com").replace(/\/+$/, "");
 const LIMIT = parseInt(process.env.PAGE_LIMIT || "100", 10);
-
 const OUT_DIR = path.resolve("data");
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
-const headers = {
-  "Authorization": `Bearer ${API_KEY}`,
-  "User-Agent": "printful-catalog-rest/1.1",
-};
+const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-rest/1.2" };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function normalizeListFromEnv(name, def) {
+  const raw = (process.env[name] ?? "").trim();
+  if (!raw) return def;
+  return raw.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+}
+
+// Endpoints REST à paginer (défaut inclut prices)
+const DEFAULT_ENDPOINTS = [
+  "/v2/catalog/categories",
+  "/v2/catalog/product-categories",
+  "/v2/countries",
+  "/v2/catalog/availability",
+  "/v2/catalog/prices"
+];
+const REST_ENDPOINTS = normalizeListFromEnv("REST_ENDPOINTS", DEFAULT_ENDPOINTS);
 
 async function fetchJsonWithRetry(url, maxRetries = 8, backoffBase = 1000) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -32,54 +42,45 @@ async function fetchJsonWithRetry(url, maxRetries = 8, backoffBase = 1000) {
       if (res.status === 429) {
         const ra = res.headers.get("retry-after");
         const wait = ra ? Math.ceil(Number(ra) * 1000) : backoffBase * (2 ** attempt);
-        await sleep(wait);
-        continue;
+        await sleep(wait); continue;
       }
-      if (res.status >= 500) {
-        await sleep(backoffBase * (2 ** attempt));
-        continue;
-      }
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`HTTP ${res.status} - ${text}`);
-      }
+      if (res.status >= 500) { await sleep(backoffBase * (2 ** attempt)); continue; }
+      if (!res.ok) throw new Error(`HTTP ${res.status} - ${await res.text()}`);
       return await res.json();
     } catch (err) {
       if (attempt === maxRetries) throw err;
       await sleep(backoffBase * (2 ** attempt));
     }
   }
-  throw new Error("Unreachable");
 }
 
-// Paginé: tente ?limit&offset, sinon lit tout (si pas de paging renvoyé par l'API).
-async function pagedFetch(endpointPath, limit) {
-  let offset = 0;
-  const rows = [];
-  let total = null;
+function endpointToCsvName(endpointPath) {
+  return endpointPath.replace(/^\/+/, "").replace(/\/+/g, "_") + ".csv";
+}
 
+// Paginé quand dispo, sinon récupère tout d'un coup
+async function pagedFetch(endpointPath, limit) {
+  let offset = 0, total = null;
+  const rows = [];
   while (true) {
     const url = `${BASE_URL}${endpointPath}?limit=${limit}&offset=${offset}`;
     const data = await fetchJsonWithRetry(url);
     const result = data?.result ?? [];
     const paging = data?.paging ?? {};
-
     const items = (result && typeof result === "object" && "items" in result) ? result.items : result;
 
-    // Si l'API ne pagine pas (pas de tableau paginé, ni paging), on prend tout et on sort.
+    // Pas de pagination (endpoint renvoie tout)
     if (!Array.isArray(items) || (!paging || typeof paging.total !== "number")) {
       const flat = Array.isArray(items) ? items : (Array.isArray(result) ? result : []);
       for (const it of flat) rows.push(typeof it === "object" ? it : { value: it });
-      break; // pas de pagination à poursuivre
+      break;
     }
 
     if (total == null && typeof paging.total === "number") total = paging.total;
-
     for (const it of items) rows.push(typeof it === "object" ? it : { value: it });
 
     const fetched = items.length;
     offset += fetched;
-
     if (fetched === 0) break;
     if (total != null && offset >= total) break;
   }
@@ -87,45 +88,36 @@ async function pagedFetch(endpointPath, limit) {
 }
 
 function writeCsv(filePath, rows) {
-  const headersSet = new Set();
-  for (const r of rows) Object.keys(r).forEach(k => headersSet.add(k));
+  const headersSet = new Set(); rows.forEach(r => Object.keys(r).forEach(k => headersSet.add(k)));
   const cols = Array.from(headersSet).sort();
-
   const lines = [];
   lines.push(cols.map(c => `"${c.replace(/"/g, '""')}"`).join(","));
   for (const r of rows) {
-    const o = {};
-    for (const c of cols) {
-      const v = r[c];
-      let s = v;
-      if (v && typeof v === "object") s = JSON.stringify(v);
-      if (s === undefined || s === null) s = "";
-      const cell = String(s).replace(/"/g, '""');
-      o[c] = `"${cell}"`;
-    }
-    lines.push(cols.map(c => o[c]).join(","));
+    const out = cols.map(c => {
+      let v = r[c]; if (v && typeof v === "object") v = JSON.stringify(v);
+      const s = (v ?? "").toString().replace(/"/g, '""');
+      return `"${s}"`;
+    });
+    lines.push(out.join(","));
   }
   fs.writeFileSync(filePath, lines.join("\n"), "utf8");
   console.log(`Wrote ${filePath} — ${rows.length} rows`);
 }
 
-function variantsCsvPath() {
+const variantsCsvPath = () => {
   const p = path.join(OUT_DIR, "variants.csv");
   return fs.existsSync(p) ? p : null;
-}
+};
 
 function* readCsvIds(filePath, idKeys = ["id", "variant_id", "variantId"]) {
   const text = fs.readFileSync(filePath, "utf8");
-  const lines = text.split(/\r?\n/).filter(l => l.length > 0);
+  const lines = text.split(/\r?\n/).filter(Boolean);
   if (lines.length === 0) return;
   const headers = lines[0].split(",").map(h => h.replace(/^"|"$/g, "").trim());
-  const keyIdx = idKeys
-    .map(k => headers.findIndex(h => h === k))
-    .find(idx => idx !== -1);
+  const keyIdx = idKeys.map(k => headers.findIndex(h => h === k)).find(idx => idx !== -1);
   if (keyIdx === undefined || keyIdx === -1) return;
   for (let i = 1; i < lines.length; i++) {
-    const line = lines[i];
-    const cols = line.match(/("([^"]|"")*"|[^,]*)/g)?.map(s => s.replace(/^"|"$/g, "").replace(/""/g, '"')) || [];
+    const cols = lines[i].match(/("([^"]|"")*"|[^,]*)/g)?.map(s => s.replace(/^"|"$/g, "").replace(/""/g, '"')) || [];
     const val = cols[keyIdx];
     if (val) yield val;
   }
@@ -136,29 +128,24 @@ async function fetchVariantImages(variantId) {
   const data = await fetchJsonWithRetry(url);
   let items = data?.result ?? [];
   if (items && typeof items === "object" && "items" in items) items = items.items;
-  return (items || []).map(img => (typeof img === "object" ? { ...img } : { value: img })).map(r => ({ ...r, variant_id: variantId }));
+  return (items || []).map(img => (typeof img === "object" ? { ...img } : { value: img }))
+                      .map(r => ({ ...r, variant_id: variantId }));
 }
 
-// Pagine les IDs de variantes si variants.csv n’existe pas encore (REST avant CORE)
+// Stream d'IDs variantes si variants.csv n’existe pas encore (REST avant CORE)
 async function* iterateVariantIds(limit) {
-  // On stream les IDs en paginant /catalog/variants
-  let offset = 0;
-  let total = null;
-
+  let offset = 0, total = null;
   while (true) {
     const url = `${BASE_URL}/v2/catalog/variants?limit=${limit}&offset=${offset}`;
     const data = await fetchJsonWithRetry(url);
     const result = data?.result ?? [];
     const paging = data?.paging ?? {};
     const items = (result && typeof result === "object" && "items" in result) ? result.items : result;
-
     if (!Array.isArray(items) || items.length === 0) break;
-
     for (const it of items) {
       const id = (it && typeof it === "object") ? (it.id ?? it.variant_id ?? it.variantId) : null;
       if (id != null) yield String(id);
     }
-
     if (total == null && typeof paging.total === "number") total = paging.total;
     offset += items.length;
     if (total != null && offset >= total) break;
@@ -167,56 +154,41 @@ async function* iterateVariantIds(limit) {
 
 (async () => {
   try {
-    // 1) Categories (paginées si applicable)
-    const categories = await pagedFetch("/v2/catalog/categories", LIMIT);
-    writeCsv(path.join(OUT_DIR, "categories.csv"), categories);
-
-    // 2) Product categories (paginées si applicable)
-    try {
-      const productCategories = await pagedFetch("/v2/catalog/product-categories", LIMIT);
-      writeCsv(path.join(OUT_DIR, "product_categories.csv"), productCategories);
-    } catch (e) {
-      console.warn("product-categories endpoint failed; writing empty CSV.");
-      writeCsv(path.join(OUT_DIR, "product_categories.csv"), []);
+    // 1) Endpoints REST dynamiques
+    for (const ep of REST_ENDPOINTS) {
+      try {
+        const rows = await pagedFetch(ep, LIMIT);
+        const outName = endpointToCsvName(ep);
+        writeCsv(path.join(OUT_DIR, outName), rows);
+      } catch (e) {
+        console.warn(`Warn: ${ep} failed — writing empty CSV.`, e?.message || e);
+        const outName = endpointToCsvName(ep);
+        writeCsv(path.join(OUT_DIR, outName), []);
+      }
     }
 
-    // 3) Countries (paginées si applicable)
-    const countries = await pagedFetch("/v2/countries", LIMIT);
-    writeCsv(path.join(OUT_DIR, "countries.csv"), countries);
-
-    // 4) Availability (paginées si applicable)
-    try {
-      const availability = await pagedFetch("/v2/catalog/availability", LIMIT);
-      writeCsv(path.join(OUT_DIR, "availability.csv"), availability);
-    } catch (e) {
-      console.warn("availability endpoint failed; writing empty CSV.");
-      writeCsv(path.join(OUT_DIR, "availability.csv"), []);
-    }
-
-    // 5) Product images
-    const vcsv = variantsCsvPath();
+    // 2) Product images (fonctionne même si CORE pas encore lancé)
+    const pimgOut = path.join(OUT_DIR, "product_images.csv");
     const images_rows = [];
+    const vcsv = variantsCsvPath();
+
     if (vcsv) {
-      // Lire les IDs depuis variants.csv
       let count = 0;
       for (const vid of readCsvIds(vcsv)) {
         const imgs = await fetchVariantImages(vid);
         images_rows.push(...imgs);
-        count++;
-        if (count % 250 === 0) console.log(`...fetched images for ${count} variants`);
+        if (++count % 250 === 0) console.log(`...fetched images for ${count} variants`);
       }
     } else {
-      // REST avant CORE : pagine les variantes pour récupérer au moins les images
       let count = 0;
       for await (const vid of iterateVariantIds(LIMIT)) {
         const imgs = await fetchVariantImages(vid);
         images_rows.push(...imgs);
-        count++;
-        if (count % 250 === 0) console.log(`...fetched images for ${count} variants (REST pre-core)`);
+        if (++count % 250 === 0) console.log(`...fetched images for ${count} variants (REST pre-core)`);
       }
     }
-    writeCsv(path.join(OUT_DIR, "product_images.csv"), images_rows);
 
+    writeCsv(pimgOut, images_rows);
     console.log("REST done.");
   } catch (e) {
     console.error("REST failed:", e?.message || e);

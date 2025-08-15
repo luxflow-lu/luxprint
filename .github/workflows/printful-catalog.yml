@@ -34,7 +34,7 @@ jobs:
         run: |
           node scripts/rest/run_rest.mjs
         env:
-          PRINTFUL_API_KEY: ${{ env.PRINTFUL_API_KEY }}
+          PRINTFUL_TOKEN: ${{ env.PRINTFUL_TOKEN }}
           PAGE_LIMIT: ${{ env.PAGE_LIMIT }}
           BASE_URL: ${{ env.BASE_URL }}
 

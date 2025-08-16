@@ -1,0 +1,88 @@
+name: Printful - Single Collection (v2, EU-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      collection:
+        description: |
+          Collection à extraire (une seule) :
+          - categories
+          - countries
+          - availability
+          - prices          (prix par variante)
+          - product_images  (images par variante)
+          - product_categories
+          - product_prices
+          - sizes
+          - products
+          - variants
+        type: choice
+        required: true
+        default: availability
+        options:
+          - categories
+          - countries
+          - availability
+          - prices
+          - product_images
+          - product_categories
+          - product_prices
+          - sizes
+          - products
+          - variants
+      page_limit:
+        description: "Taille de page API (1–100)"
+        required: false
+        default: "100"
+      concurrency:
+        description: "Concurrence initiale (4..12)"
+        required: false
+        default: "8"
+      eu_only:
+        description: "Filtrer EU uniquement ?"
+        type: choice
+        options: ["true", "false"]
+        required: false
+        default: "true"
+      use_eu_cache:
+        description: "Réutiliser/écrire le cache EU ?"
+        type: choice
+        options: ["true", "false"]
+        required: false
+        default: "true"
+      strict:
+        description: "Echouer si contrôles critiques KO ?"
+        type: choice
+        options: ["true", "false"]
+        required: false
+        default: "true"
+
+env:
+  BASE_URL: "https://api.printful.com"
+
+jobs:
+  run:
+    name: Run selected collection
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run collector
+        run: node scripts/collect/run_collection.mjs
+        env:
+          PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}
+          BASE_URL: ${{ env.BASE_URL }}
+          COLLECTION: ${{ inputs.collection }}
+          PAGE_LIMIT: ${{ inputs.page_limit }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          EU_ONLY: ${{ inputs.eu_only }}
+          USE_EU_CACHE: ${{ inputs.use_eu_cache }}
+          STRICT: ${{ inputs.strict }}
+          LOG_EVERY: "200"
+
+      - name: Upload data artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-${{ inputs.collection }}
+          path: data/*
+          if-no-files-found: warn

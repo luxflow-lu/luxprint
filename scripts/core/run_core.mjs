@@ -1,7 +1,4 @@
-// CORE (v2): /v2/catalog-products + /v2/catalog-products/{id}/catalog-variants
-// - Ecrit products.csv et variants.csv
-// - EU_ONLY=true => conserve uniquement les produits ayant ≥1 variante EU et les variantes EU
-//   (fait 1 appel availability/variante -> plus lent ; mets EU_ONLY=false si tu veux juste tout le core rapidement)
+// CORE (v2): products & variants, EU_ONLY option, cap limit 1..100, no-retry sur 400
 
 import fs from "node:fs";
 import path from "node:path";
@@ -9,11 +6,12 @@ import path from "node:path";
 const API_KEY = process.env.PRINTFUL_TOKEN;
 if (!API_KEY) { console.error("Missing PRINTFUL_TOKEN in env."); process.exit(1); }
 
-const BASE_URL = (process.env.BASE_URL || "https://api.printful.com").replace(/\/+$/, "");
-const LIMIT = Number.parseInt(process.env.PAGE_LIMIT || "150", 10);
+const RAW_LIMIT = Number.parseInt(process.env.PAGE_LIMIT || "100", 10);
+const LIMIT = Math.min(Math.max(isNaN(RAW_LIMIT) ? 100 : RAW_LIMIT, 1), 100); // <- cap
 const LOG_EVERY = Number.parseInt(process.env.LOG_EVERY || "200", 10);
 const EU_ONLY = (process.env.EU_ONLY ?? "true") === "true";
 
+const BASE_URL = (process.env.BASE_URL || "https://api.printful.com").replace(/\/+$/, "");
 const OUT_DIR = path.resolve("data");
 const CKPT_DIR = path.resolve(".checkpoints");
 fs.mkdirSync(OUT_DIR, { recursive: true });
@@ -21,7 +19,7 @@ fs.mkdirSync(CKPT_DIR, { recursive: true });
 
 const CKPT_PRODUCTS = path.join(CKPT_DIR, "core_v2_catalog-products.json");
 
-const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-core-v2/1.2" };
+const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-core-v2/1.3" };
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 const EU_COUNTRIES = (process.env.EU_COUNTRIES ??
@@ -44,9 +42,15 @@ async function fetchJsonWithRetry(url, maxRetries = 8, backoff = 1000) {
         console.log(`5xx received, waiting ${wait}ms`);
         await sleep(wait); continue;
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status} - ${await res.text()}`);
+      if (!res.ok) {
+        const txt = await res.text();
+        const err = new Error(`HTTP ${res.status} - ${txt}`);
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) err._noRetry = true;
+        throw err;
+      }
       return await res.json();
     } catch (e) {
+      if (e?._noRetry) throw e;
       if (a === maxRetries) throw e;
       const wait = backoff * (2 ** a);
       console.log(`Retrying after error (${e?.message || e}) in ${wait}ms`);
@@ -89,12 +93,10 @@ function writeCsv(filePath, rows) {
 }
 
 function loadProductOffset() {
-  try {
-    if (fs.existsSync(CKPT_PRODUCTS)) {
-      const j = JSON.parse(fs.readFileSync(CKPT_PRODUCTS, "utf8"));
-      return Number(j.product_offset || 0) || 0;
-    }
-  } catch {}
+  try { if (fs.existsSync(CKPT_PRODUCTS)) {
+    const j = JSON.parse(fs.readFileSync(CKPT_PRODUCTS, "utf8"));
+    return Number(j.product_offset || 0) || 0;
+  }} catch {}
   return 0;
 }
 function saveProductOffset(off) {
@@ -102,28 +104,26 @@ function saveProductOffset(off) {
 }
 
 async function* pageProducts(limit, start = 0) {
-  let offset = start, total = null;
+  let offset = start;
   while (true) {
     const url = `${BASE_URL}/v2/catalog-products?limit=${limit}&offset=${offset}`;
     const json = await fetchJsonWithRetry(url);
     const { items, paging } = parseItemsAndPaging(json);
     const fetched = items.length;
-    yield { items, offset, fetched, total: paging?.total ?? null };
+    yield { items, offset, fetched };
     offset += fetched;
     if (!paging || typeof paging.total !== "number" || fetched === 0 || offset >= paging.total) break;
   }
 }
 
 async function pagedVariantsForProduct(pid, limit) {
-  const rows = [];
-  let offset = 0;
+  const rows = []; let offset = 0;
   while (true) {
     const url = `${BASE_URL}/v2/catalog-products/${encodeURIComponent(pid)}/catalog-variants?limit=${limit}&offset=${offset}`;
     const json = await fetchJsonWithRetry(url);
     const { items, paging } = parseItemsAndPaging(json);
     rows.push(...items);
-    const fetched = items.length;
-    offset += fetched;
+    const fetched = items.length; offset += fetched;
     if (!paging || typeof paging.total !== "number" || fetched === 0 || offset >= paging.total) break;
   }
   return rows;
@@ -142,14 +142,12 @@ async function isVariantEU(vid) {
       if (typeof it?.region === "string" && it.region.toUpperCase() === "EU") return true;
     }
     return false;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
 (async function main() {
   try {
-    console.log(`CORE v2 start — EU_ONLY=${EU_ONLY}, PAGE_LIMIT=${LIMIT}`);
+    console.log(`CORE v2 start — EU_ONLY=${EU_ONLY}, PAGE_LIMIT=${LIMIT} (raw=${RAW_LIMIT})`);
     const productsOut = [];
     const variantsOut = [];
 
@@ -190,9 +188,7 @@ async function isVariantEU(vid) {
               variantsOut.push(row);
               keptVariantsEU++;
             }
-            if (vCount % LOG_EVERY === 0) {
-              console.log(`...variants processed=${vCount}, keptEU=${keptVariantsEU}`);
-            }
+            if (vCount % LOG_EVERY === 0) console.log(`...variants processed=${vCount}, keptEU=${keptVariantsEU}`);
           }
           if (productHasEU) { productsOut.push(prodRow); keptProductsEU++; }
         }

@@ -44,6 +44,14 @@ on:
         options: ["true", "false"]
         required: false
         default: "true"
+      av_region:
+        description: "Région d'availability (europe | all)"
+        required: false
+        default: "europe"
+      eu_region_names:
+        description: "Noms de régions à considérer EU si av_region=all (CSV)"
+        required: false
+        default: "europe,uk,france,germany,italy,spain,latvia"
       use_eu_cache:
         description: "Réutiliser/écrire le cache EU ?"
         type: choice
@@ -76,6 +84,8 @@ jobs:
           PAGE_LIMIT: ${{ inputs.page_limit }}
           CONCURRENCY: ${{ inputs.concurrency }}
           EU_ONLY: ${{ inputs.eu_only }}
+          AV_REGION: ${{ inputs.av_region }}
+          EU_REGION_NAMES: ${{ inputs.eu_region_names }}
           USE_EU_CACHE: ${{ inputs.use_eu_cache }}
           STRICT: ${{ inputs.strict }}
           LOG_EVERY: "200"

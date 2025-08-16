@@ -1,4 +1,4 @@
-name: Printful Catalog Split Run (v2, EU-only)
+name: Printful Catalog Split Run (v2, EU-only, adaptive)
 
 on:
   workflow_dispatch:
@@ -10,11 +10,11 @@ on:
         default: rest
         options: [rest, core, both]
       page_limit:
-        description: "Taille de page API (défaut 200)"
+        description: "Taille de page API (100–200 recommandé)"
         required: false
-        default: "200"
+        default: "150"
       concurrency:
-        description: "Concurrence (variants) – 6..12 recommandé"
+        description: "Concurrence initiale (variants) – 4..12"
         required: false
         default: "8"
       eu_only:
@@ -66,7 +66,6 @@ jobs:
           PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}
           PAGE_LIMIT: ${{ inputs.page_limit }}
           BASE_URL: ${{ env.BASE_URL }}
-          # tu peux mettre "false" pour récupérer le core complet (plus rapide)
           EU_ONLY: ${{ inputs.eu_only }}
           LOG_EVERY: "200"
 

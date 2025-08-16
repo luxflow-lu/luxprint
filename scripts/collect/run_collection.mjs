@@ -1,4 +1,4 @@
-// Single-collection collector (v2, EU-only option)
+// Single-collection collector (v2, EU-only option, product-level availability)
 // Collections supportées (COLLECTION, une seule) :
 //   - categories            -> data/categories.csv
 //   - countries             -> data/countries.csv
@@ -11,14 +11,12 @@
 //   - products              -> data/products.csv
 //   - variants              -> data/variants.csv
 //
-// Chaque collection peut tourner seule :
-// - S'il faut des IDs (produits/variantes) et que le cache EU n'est pas dispo, le script scanne l'API.
-// - Si USE_EU_CACHE=true, on (re)lit/écrit data/_eu_product_ids.(json|txt) et data/_eu_variant_ids.(json|txt)
-//
 // Robustesse : rate limiter global + backoff, cap limit 1..100, EU_ONLY par défaut, STRICT checks, logs.
+// Availability : /v2/catalog-products/{id}/availability?selling_region_name=europe (ou all)
 //
 // Env requis : PRINTFUL_TOKEN
-// Env optionnels : BASE_URL, COLLECTION, PAGE_LIMIT, CONCURRENCY, EU_ONLY, USE_EU_CACHE, STRICT, LOG_EVERY
+// Env optionnels : BASE_URL, COLLECTION, PAGE_LIMIT, CONCURRENCY, EU_ONLY, AV_REGION, EU_REGION_NAMES,
+//                  USE_EU_CACHE, STRICT, LOG_EVERY, EU_COUNTRIES
 
 import fs from "node:fs";
 import path from "node:path";
@@ -38,6 +36,11 @@ const LOG_EVERY = Number.parseInt(process.env.LOG_EVERY || "200", 10);
 const EU_ONLY = (process.env.EU_ONLY ?? "true") === "true";
 const USE_EU_CACHE = (process.env.USE_EU_CACHE ?? "true") === "true";
 const STRICT = (process.env.STRICT ?? "true") === "true";
+
+// Availability options
+const AV_REGION = (process.env.AV_REGION || "europe").toLowerCase(); // "europe" | "all"
+const EU_REGION_NAMES = (process.env.EU_REGION_NAMES || "europe,uk,france,germany,italy,spain,latvia")
+  .split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
 
 const EU_COUNTRIES = (process.env.EU_COUNTRIES ??
   "AT,BE,BG,HR,CY,CZ,DK,EE,FI,FR,DE,GR,HU,IE,IT,LV,LT,LU,MT,NL,PL,PT,RO,SK,SI,ES,SE,GB,NO,CH,IS,LI"
@@ -126,7 +129,7 @@ let active = 0;
 let globalPauseUntil = 0;
 let successStreak = 0;
 
-const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-collection-v2/1.0" };
+const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-collection-v2/1.1" };
 
 async function acquireSlot() {
   while (true) {
@@ -250,16 +253,6 @@ function writeCsv(filePath, rows) {
 
 // --------- EU utils
 function isEUCountry(code) { return !!code && EU_COUNTRIES.includes(String(code).toUpperCase()); }
-function filterAvailabilityToEU(items) {
-  const arr = Array.isArray(items) ? items : (items ? [items] : []);
-  return arr.filter(it => {
-    if (isEUCountry(it?.country_code)) return true;
-    if (Array.isArray(it?.countries) && it.countries.some(isEUCountry)) return true;
-    if (Array.isArray(it?.country_codes) && it.country_codes.some(isEUCountry)) return true;
-    if (typeof it?.region === "string" && it.region.toUpperCase() === "EU") return true;
-    return false;
-  });
-}
 
 // --------- API helpers (product/variant)
 async function listCatalogProducts() {
@@ -293,11 +286,6 @@ async function fetchProductSizes(pid) {
     throw e;
   }
 }
-async function fetchVariantAvailability(vid) {
-  const json = await fetchJsonWithRetry(`${BASE_URL}/v2/catalog-variants/${encodeURIComponent(vid)}/availability`);
-  const { items } = parseItemsAndPaging(json);
-  return filterAvailabilityToEU(items).map(it => ({ ...(typeof it === "object" ? it : { value: it }), variant_id: vid }));
-}
 async function fetchVariantImages(vid) {
   const json = await fetchJsonWithRetry(`${BASE_URL}/v2/catalog-variants/${encodeURIComponent(vid)}/images`);
   const { items } = parseItemsAndPaging(json);
@@ -309,56 +297,105 @@ async function fetchVariantPrices(vid) {
   return items.map(it => ({ ...(typeof it === "object" ? it : { value: it }), variant_id: vid }));
 }
 
-// --------- EU discovery (scan) if needed
+// --------- Availability (product-level)
+async function fetchProductAvailability(pid, region = AV_REGION) {
+  const q = region ? `?selling_region_name=${encodeURIComponent(region)}` : "";
+  const url = `${BASE_URL}/v2/catalog-products/${encodeURIComponent(pid)}/availability${q}`;
+  const json = await fetchJsonWithRetry(url);
+  const { items } = parseItemsAndPaging(json);
+  return items || [];
+}
+
+function hasEUAvailability(item) {
+  // item: { catalog_variant_id, techniques: [{ technique, selling_regions: [{ name, availability, placement_option_availability: [...] }]}]}
+  const techs = Array.isArray(item?.techniques) ? item.techniques : [];
+  for (const t of techs) {
+    const regs = Array.isArray(t?.selling_regions) ? t.selling_regions : [];
+    for (const r of regs) {
+      const name = String(r?.name || "").toLowerCase();
+      if (AV_REGION === "europe") {
+        const a = String(r?.availability || "").toLowerCase();
+        if (name === "europe" && a !== "not available") return true;
+      } else {
+        if (EU_REGION_NAMES.includes(name)) {
+          const a = String(r?.availability || "").toLowerCase();
+          if (a !== "not available") return true;
+          if (Array.isArray(r?.placement_option_availability) && r.placement_option_availability.some(po => !!po?.availability)) {
+            return true;
+          }
+        }
+      }
+    }
+  }
+  return false;
+}
+
+function flattenEUAvailability(item) {
+  const rows = [];
+  const vid = item?.catalog_variant_id ?? item?.variant_id;
+  if (!vid) return rows;
+
+  const techs = Array.isArray(item?.techniques) ? item.techniques : [];
+  for (const t of techs) {
+    const regs = Array.isArray(t?.selling_regions) ? t.selling_regions : [];
+    for (const r of regs) {
+      const name = String(r?.name || "");
+      const lname = name.toLowerCase();
+      const isEU = AV_REGION === "europe" ? (lname === "europe") : EU_REGION_NAMES.includes(lname);
+      if (!isEU) continue;
+
+      rows.push({
+        variant_id: vid,
+        technique: t?.technique ?? null,
+        region: name,
+        availability: r?.availability ?? null,
+        placement_option_availability: r?.placement_option_availability ?? null
+      });
+    }
+  }
+  return rows;
+}
+
+// --------- EU discovery (scan) if needed — via product availability
 async function discoverEUIds() {
   const euProd = new Set();
   const euVar = new Set();
-  const availabilityRows = []; // si la collection demandée est "availability", on remplit ici
+  const availabilityRows = []; // rempli seulement si SELECTED === "availability"
 
   const products = await listCatalogProducts();
   console.log(`Found ${products.length} catalog products`);
 
-  let pCount = 0, vCount = 0, keptP = 0, keptV = 0;
+  let pCount = 0, keptP = 0, keptV = 0;
 
   for (const p of products) {
     const pid = p?.id ?? p?.product_id ?? p?.catalog_product_id;
     if (pid == null) continue;
 
-    let variants = [];
-    try { variants = await pagedVariantsForProduct(pid); }
-    catch (e) { console.warn(`product ${pid} variants failed:`, e.message || e); }
+    let avItems = [];
+    try {
+      avItems = await fetchProductAvailability(pid, AV_REGION);
+    } catch (e) {
+      console.warn(`product ${pid} availability failed:`, e.message || e);
+      avItems = [];
+    }
 
     let anyEU = false;
+    for (const it of avItems) {
+      const vid = it?.catalog_variant_id ?? it?.variant_id;
+      if (!vid) continue;
 
-    for (const v of variants) {
-      const vid = v?.id ?? v?.variant_id;
-      if (vid == null) continue;
-
-      let avs = [];
-      if (EU_ONLY || SELECTED === "availability") {
-        try { avs = await fetchVariantAvailability(vid); } catch { avs = []; }
-      }
-
-      const isEU = EU_ONLY ? (avs.length > 0) : true;
-
-      if (SELECTED === "availability") {
-        // on enregistre les lignes EU seulement (si EU_ONLY) — sinon brut
-        availabilityRows.push(...avs);
-      }
-
+      const isEU = EU_ONLY ? hasEUAvailability(it) : true;
       if (isEU) {
         anyEU = true;
         euVar.add(String(vid));
         keptV++;
-      }
-
-      vCount++;
-      if (vCount % LOG_EVERY === 0) {
-        console.log(`...variants scanned=${vCount}, keptEU=${keptV}, minInterval=${rate.minIntervalMs}ms, conc=${targetConc}, active=${active}`);
+        if (SELECTED === "availability") {
+          availabilityRows.push(...flattenEUAvailability(it));
+        }
       }
     }
 
-    if (anyEU || !EU_ONLY) {
+    if (!EU_ONLY || anyEU) {
       euProd.add(String(pid));
       keptP++;
     }
@@ -375,13 +412,14 @@ async function discoverEUIds() {
 // --------- Main (per collection)
 (async function main() {
   const startedAt = new Date().toISOString();
-  const errors = [];
   const warnings = [];
   const counts = {};
   let usedCache = false;
 
   try {
     console.log(`Collector start — collection=${SELECTED}, EU_ONLY=${EU_ONLY}, PAGE_LIMIT=${LIMIT} (raw=${RAW_LIMIT}), INIT_CONC=${INIT_CONC}`);
+    console.log(`Availability: AV_REGION=${AV_REGION}${AV_REGION === "all" ? `, EU_REGION_NAMES=[${EU_REGION_NAMES.join(", ")}]` : ""}`);
+
     const file = {
       categories:       path.join(OUT_DIR, "categories.csv"),
       countries:        path.join(OUT_DIR, "countries.csv"),
@@ -419,8 +457,8 @@ async function discoverEUIds() {
         }
       }
 
+      // Si pas de cache, ou si on veut availability (toujours reconstruit), on (re)scanne via availability produit
       if (!euProd || !euVar || SELECTED === "availability") {
-        // (re)scan si pas de cache ou si on veut availability (on la construit)
         ({ euProd, euVar, availabilityRows } = await discoverEUIds());
         if (EU_ONLY && USE_EU_CACHE) {
           writeIdSet(euProd, EU_PROD_JSON, EU_PROD_TXT);
@@ -512,7 +550,7 @@ async function discoverEUIds() {
       }
     }
 
-    // ---- Basic checks per collection (STRICT)
+    // ---- Checks (STRICT) & report
     const endedAt = new Date().toISOString();
     const errorsCrit = [];
     if (SELECTED === "categories" && (!counts.categories || counts.categories === 0)) errorsCrit.push("categories.csv est vide");
@@ -526,12 +564,13 @@ async function discoverEUIds() {
     if (SELECTED === "products" && (!counts.products || counts.products === 0)) errorsCrit.push("products.csv est vide");
     if (SELECTED === "variants" && (!counts.variants || counts.variants === 0)) errorsCrit.push("variants.csv est vide");
 
-    // Rapport minimal
     const report = {
       startedAt, endedAt,
       base_url: BASE_URL,
       collection: SELECTED,
       eu_only: EU_ONLY,
+      av_region: AV_REGION,
+      eu_region_names: AV_REGION === "all" ? EU_REGION_NAMES : undefined,
       page_limit_raw: RAW_LIMIT, page_limit_effective: LIMIT,
       rate_min_interval_ms: rate.minIntervalMs,
       concurrency_final: targetConc,
@@ -548,6 +587,7 @@ async function discoverEUIds() {
         `Started: ${startedAt}`,
         `Ended:   ${endedAt}`,
         `EU_ONLY: ${EU_ONLY}`,
+        `AV_REGION: ${AV_REGION}${AV_REGION === "all" ? ` (EU_REGION_NAMES=[${EU_REGION_NAMES.join(", ")}])` : ""}`,
         `Limit:   raw=${RAW_LIMIT} effective=${LIMIT}`,
         `Rate:    minInterval=${rate.minIntervalMs}ms, final concurrency=${targetConc}`,
         `EU cache used: ${usedCache}`,

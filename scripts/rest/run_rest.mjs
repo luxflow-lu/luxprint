@@ -1,4 +1,4 @@
-// REST (v2 only, EU-only par défaut) — anti-429 adaptatif, no-retry sur 400
+// REST (v2 only, EU-only) — hard rate limiter + anti-429 adaptatif, no-retry 4xx (sauf 429)
 // Génère : categories.csv, countries.csv, product_categories.csv, product_prices.csv,
 // sizes.csv, product_images.csv, availability.csv (EU), prices.csv (EU)
 
@@ -22,29 +22,48 @@ const EU_COUNTRIES = (process.env.EU_COUNTRIES ??
 const OUT_DIR = path.resolve("data");
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
-// ---------- Concurrence & pause globale ----------
+// ---------- Rate limiter (global) ----------
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const now = () => Date.now();
+const jitter = (ms) => Math.floor(ms * (0.85 + Math.random() * 0.3));
+
+class RateLimiter {
+  constructor(minIntervalMs = 250) {
+    this.minIntervalMs = minIntervalMs; // intervalle minimal entre DEBUTS de requêtes
+    this.nextAt = 0;
+  }
+  async waitTurn() {
+    const n = now();
+    if (n < this.nextAt) await sleep(this.nextAt - n);
+    this.nextAt = Math.max(this.nextAt, now()) + this.minIntervalMs;
+  }
+  bumpFromRetryAfter(sec) {
+    const ms = Math.ceil(Number(sec) * 1000);
+    if (!isNaN(ms) && ms > 0) {
+      this.minIntervalMs = Math.max(this.minIntervalMs, ms);
+      this.nextAt = now() + this.minIntervalMs;
+      console.log(`[rate] set minInterval=${this.minIntervalMs}ms from Retry-After=${sec}s`);
+    }
+  }
+}
+const rate = new RateLimiter(500); // on commence doux; sera ajusté par Retry-After
+
+// ---------- Concurrence & anti-429 ----------
 let targetConc = Math.max(2, INIT_CONC);
-const MIN_CONC = 2;
+const MIN_CONC = 1;
 const MAX_CONC = Math.max(INIT_CONC, 8);
 let active = 0;
 let globalPauseUntil = 0;
 let successStreak = 0;
 
-const headers = {
-  "Authorization": `Bearer ${API_KEY}`,
-  "User-Agent": "printful-catalog-rest-v2/1.5",
-};
-
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const now = () => Date.now();
-const jitter = (ms) => Math.floor(ms * (0.85 + Math.random() * 0.3));
+const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-rest-v2/1.6" };
 
 async function acquireSlot() {
   while (true) {
     const waitMs = globalPauseUntil - now();
     if (waitMs > 0) await sleep(waitMs);
     if (active < targetConc) { active++; return; }
-    await sleep(25);
+    await sleep(15);
   }
 }
 function releaseSlot() { active = Math.max(0, active - 1); }
@@ -63,41 +82,50 @@ async function fetchJsonWithRetry(url, maxRetries = 8, baseBackoff = 1000) {
   for (let a = 0; a <= maxRetries; a++) {
     await acquireSlot();
     try {
+      // cadence globale (même si plusieurs tâches concurrentes)
+      await rate.waitTurn();
+
+      // pause globale éventuelle (suite à une erreur précédente)
       const waitMs = globalPauseUntil - now();
       if (waitMs > 0) await sleep(waitMs);
 
       const res = await fetch(url, { headers });
+
       if (res.status === 429) {
         const ra = res.headers.get("retry-after");
+        if (ra) rate.bumpFromRetryAfter(Number(ra));
         let wait = ra ? Math.ceil(Number(ra) * 1000) : baseBackoff * (2 ** a);
         wait = jitter(wait);
         globalPauseUntil = now() + wait;
-        console.log(`[429] waiting ~${wait}ms (retry-after=${ra || "n/a"})`);
+        console.log(`[429] waiting ~${wait}ms (retry-after=${ra || "n/a"}), conc=${targetConc}, active=${active}`);
         reduceConcurrency();
         continue;
       }
+
       if (res.status >= 500) {
         const wait = jitter(baseBackoff * (2 ** a));
         globalPauseUntil = now() + wait;
         console.log(`[5xx:${res.status}] waiting ~${wait}ms`);
         continue;
       }
+
       if (!res.ok) {
         const txt = await res.text();
         const err = new Error(`HTTP ${res.status} - ${txt}`);
-        if (res.status >= 400 && res.status < 500 && res.status !== 429) err._noRetry = true; // no-retry sur 4xx
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) err._noRetry = true;
         throw err;
       }
 
       const json = await res.json();
       successStreak++; maybeIncreaseConcurrency();
       return json;
+
     } catch (e) {
       if (e?._noRetry) throw e;
       if (a === maxRetries) throw e;
       const wait = jitter(baseBackoff * (2 ** a));
-      console.log(`[error:${e?.message || e}] backing off ~${wait}ms`);
       globalPauseUntil = now() + wait;
+      console.log(`[error:${e?.message || e}] backing off ~${wait}ms`);
     } finally {
       releaseSlot();
     }
@@ -136,9 +164,7 @@ async function pagedGET(pathname, limit = LIMIT) {
 }
 
 // ---------- EU helpers ----------
-function isEUCountry(code) {
-  return !!code && EU_COUNTRIES.includes(String(code).toUpperCase());
-}
+function isEUCountry(code) { return !!code && EU_COUNTRIES.includes(String(code).toUpperCase()); }
 function filterAvailabilityToEU(items) {
   const arr = Array.isArray(items) ? items : (items ? [items] : []);
   return arr.filter(it => {
@@ -274,19 +300,20 @@ async function fetchVariantPrices(vid) {
       catch (e) { console.warn(`product ${pid} variants failed:`, e.message || e); }
 
       // Vérifie EU via availability (déjà filtrée)
-      const checked = await Promise.all(variants.map(async (v) => {
+      const checked = [];
+      for (const v of variants) {
         const vid = v?.id ?? v?.variant_id;
-        if (vid == null) return null;
+        if (vid == null) continue;
         let avs = [];
         try { avs = await fetchVariantAvailability(vid); } catch { avs = []; }
         const isEU = EU_ONLY ? (avs.length > 0) : true;
-        return { v, vid, avs, isEU };
-      }));
+        checked.push({ v, vid, avs, isEU });
+      }
 
       const kept = checked.filter(x => x && x.isEU);
       const productHasEU = (!EU_ONLY) || kept.length > 0;
 
-      // Infos produit (cats/prices/sizes) seulement si au moins 1 variante EU
+      // Infos produit (cats/prices/sizes) seulement si ≥ 1 variante EU
       if (productHasEU) {
         keptProductsEU++;
         try {
@@ -302,7 +329,7 @@ async function fetchVariantPrices(vid) {
       }
 
       // variantes retenues EU : images + prices (+ availability déjà filtrée EU)
-      await Promise.all(kept.map(async ({ vid, avs }) => {
+      for (const { vid, avs } of kept) {
         try {
           const [imgs, vprs] = await Promise.all([
             fetchVariantImages(vid).catch(() => []),
@@ -315,13 +342,13 @@ async function fetchVariantPrices(vid) {
         } catch {}
         vCount++;
         if (vCount % LOG_EVERY === 0) {
-          console.log(`...variants processed=${vCount}, keptEU=${keptVariantsEU}, concurrency=${targetConc}, active=${active}`);
+          console.log(`...variants processed=${vCount}, keptEU=${keptVariantsEU}, minInterval=${(rate.minIntervalMs||0)}ms, conc=${targetConc}, active=${active}`);
         }
-      }));
+      }
 
       pCount++;
       if (pCount % Math.max(1, Math.floor(LOG_EVERY / 5)) === 0) {
-        console.log(`...products processed=${pCount}, keptEU=${keptProductsEU}, concurrency=${targetConc}, active=${active}`);
+        console.log(`...products processed=${pCount}, keptEU=${keptProductsEU}, minInterval=${(rate.minIntervalMs||0)}ms, conc=${targetConc}, active=${active}`);
       }
     }
 
@@ -336,7 +363,7 @@ async function fetchVariantPrices(vid) {
     console.log(
       "REST v2 done.",
       `Products scanned=${pCount}, keptEU=${keptProductsEU}; Variants scanned=${vCount}, keptEU=${keptVariantsEU}.`,
-      `Final concurrency=${targetConc}`
+      `Final minInterval=${rate.minIntervalMs}ms, final concurrency=${targetConc}`
     );
   } catch (e) {
     console.error("REST failed:", e?.message || e);

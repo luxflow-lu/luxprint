@@ -1,6 +1,16 @@
 // REST (v2 only, EU-only) — hard rate limiter + anti-429 adaptatif, no-retry 4xx (sauf 429)
-// Génère : categories.csv, countries.csv, product_categories.csv, product_prices.csv,
-// sizes.csv, product_images.csv, availability.csv (EU), prices.csv (EU)
+// Extrait : categories.csv, countries.csv, product_categories.csv, product_prices.csv,
+// sizes.csv, availability.csv (EU), prices.csv (EU), product_images.csv (images par variante)
+// Produit un rapport : data/_rest_run_report.json et .txt
+//
+// Env utiles (workflow):
+// - PRINTFUL_TOKEN  (obligatoire)
+// - PAGE_LIMIT      (1..100; on cappe de toute façon)
+// - CONCURRENCY     (concurrence initiale; AIMD + rate limiter global ensuite)
+// - EU_ONLY         ("true"/"false"; défaut "true")
+// - EU_COUNTRIES    (liste CSV; défaut: UE élargie + GB/NO/CH/IS/LI)
+// - LOG_EVERY       (progress logs; défaut 200)
+// - STRICT          ("true"/"false"; défaut "true" => exit 1 si erreurs critiques)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -12,6 +22,7 @@ const RAW_LIMIT = Number.parseInt(process.env.PAGE_LIMIT || "100", 10);
 const LIMIT = Math.min(Math.max(isNaN(RAW_LIMIT) ? 100 : RAW_LIMIT, 1), 100); // cap 1..100
 const LOG_EVERY = Number.parseInt(process.env.LOG_EVERY || "200", 10);
 const INIT_CONC = Number.parseInt(process.env.CONCURRENCY || "8", 10);
+const STRICT = (process.env.STRICT ?? "true") === "true";
 
 const BASE_URL = (process.env.BASE_URL || "https://api.printful.com").replace(/\/+$/, "");
 const EU_ONLY = (process.env.EU_ONLY ?? "true") === "true";
@@ -22,13 +33,13 @@ const EU_COUNTRIES = (process.env.EU_COUNTRIES ??
 const OUT_DIR = path.resolve("data");
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
-// ---------- Rate limiter (global) ----------
+// ---------------- Rate limiter global ----------------
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const now = () => Date.now();
 const jitter = (ms) => Math.floor(ms * (0.85 + Math.random() * 0.3));
 
 class RateLimiter {
-  constructor(minIntervalMs = 250) {
+  constructor(minIntervalMs = 500) {
     this.minIntervalMs = minIntervalMs; // intervalle minimal entre DEBUTS de requêtes
     this.nextAt = 0;
   }
@@ -46,9 +57,9 @@ class RateLimiter {
     }
   }
 }
-const rate = new RateLimiter(500); // on commence doux; sera ajusté par Retry-After
+const rate = new RateLimiter(500);
 
-// ---------- Concurrence & anti-429 ----------
+// ---------------- Concurrence & anti-429 ----------------
 let targetConc = Math.max(2, INIT_CONC);
 const MIN_CONC = 1;
 const MAX_CONC = Math.max(INIT_CONC, 8);
@@ -56,7 +67,7 @@ let active = 0;
 let globalPauseUntil = 0;
 let successStreak = 0;
 
-const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-rest-v2/1.6" };
+const headers = { "Authorization": `Bearer ${API_KEY}`, "User-Agent": "printful-catalog-rest-v2/1.7" };
 
 async function acquireSlot() {
   while (true) {
@@ -82,10 +93,7 @@ async function fetchJsonWithRetry(url, maxRetries = 8, baseBackoff = 1000) {
   for (let a = 0; a <= maxRetries; a++) {
     await acquireSlot();
     try {
-      // cadence globale (même si plusieurs tâches concurrentes)
       await rate.waitTurn();
-
-      // pause globale éventuelle (suite à une erreur précédente)
       const waitMs = globalPauseUntil - now();
       if (waitMs > 0) await sleep(waitMs);
 
@@ -101,14 +109,12 @@ async function fetchJsonWithRetry(url, maxRetries = 8, baseBackoff = 1000) {
         reduceConcurrency();
         continue;
       }
-
       if (res.status >= 500) {
         const wait = jitter(baseBackoff * (2 ** a));
         globalPauseUntil = now() + wait;
         console.log(`[5xx:${res.status}] waiting ~${wait}ms`);
         continue;
       }
-
       if (!res.ok) {
         const txt = await res.text();
         const err = new Error(`HTTP ${res.status} - ${txt}`);
@@ -133,7 +139,7 @@ async function fetchJsonWithRetry(url, maxRetries = 8, baseBackoff = 1000) {
   throw new Error("fetchJsonWithRetry exhausted");
 }
 
-// ---------- v2 helpers ----------
+// ---------------- v2 helpers ----------------
 function parseItemsAndPaging(payload) {
   if (!payload) return { items: [], paging: null };
   if ("data" in payload) {
@@ -163,7 +169,7 @@ async function pagedGET(pathname, limit = LIMIT) {
   return all;
 }
 
-// ---------- EU helpers ----------
+// ---------------- EU helpers ----------------
 function isEUCountry(code) { return !!code && EU_COUNTRIES.includes(String(code).toUpperCase()); }
 function filterAvailabilityToEU(items) {
   const arr = Array.isArray(items) ? items : (items ? [items] : []);
@@ -176,7 +182,7 @@ function filterAvailabilityToEU(items) {
   });
 }
 
-// ---------- CSV ----------
+// ---------------- CSV ----------------
 function writeCsv(filePath, rows) {
   const set = new Set();
   rows.forEach(r => Object.keys(r).forEach(k => set.add(k)));
@@ -196,7 +202,7 @@ function writeCsv(filePath, rows) {
   console.log(`Wrote ${filePath} — ${rows.length} rows`);
 }
 
-// ---------- top-level dumps ----------
+// ---------------- Top-level dumps ----------------
 async function dumpCategories() {
   try {
     const rows = await pagedGET("/v2/catalog-categories", LIMIT);
@@ -216,7 +222,7 @@ async function dumpCountries() {
   }
 }
 
-// ---------- per product / variant ----------
+// ---------------- Per product / variant ----------------
 async function listCatalogProducts() {
   return await pagedGET("/v2/catalog-products", LIMIT);
 }
@@ -238,6 +244,8 @@ async function fetchProductPrices(pid) {
   const { items } = parseItemsAndPaging(json);
   return items.map(it => ({ product_id: pid, ...it }));
 }
+
+let sizesNoGuideCount = 0;
 async function fetchProductSizes(pid) {
   try {
     const json = await fetchJsonWithRetry(`${BASE_URL}/v2/catalog-products/${encodeURIComponent(pid)}/sizes`);
@@ -249,7 +257,7 @@ async function fetchProductSizes(pid) {
     }));
   } catch (e) {
     const msg = e?.message || "";
-    if (msg.includes("No size guides") || msg.includes("HTTP 404")) return [];
+    if (msg.includes("No size guides") || msg.includes("HTTP 404")) { sizesNoGuideCount++; return []; }
     throw e;
   }
 }
@@ -269,8 +277,12 @@ async function fetchVariantPrices(vid) {
   return items.map(it => ({ ...(typeof it === "object" ? it : { value: it }), variant_id: vid }));
 }
 
-// ---------- main ----------
+// ---------------- Main ----------------
 (async function main() {
+  const startedAt = new Date().toISOString();
+  const errors = [];
+  const warnings = [];
+
   try {
     console.log(`REST v2 start — EU_ONLY=${EU_ONLY}, PAGE_LIMIT=${LIMIT} (raw=${RAW_LIMIT}), INIT_CONCURRENCY=${INIT_CONC}`);
 
@@ -283,6 +295,9 @@ async function fetchVariantPrices(vid) {
     const variantImages = [];
     const variantAvailability = [];
     const variantPrices = [];
+
+    const keptProductIds = new Set();
+    const keptVariantIds = new Set();
 
     const products = await listCatalogProducts();
     console.log(`Found ${products.length} catalog products`);
@@ -315,31 +330,35 @@ async function fetchVariantPrices(vid) {
 
       // Infos produit (cats/prices/sizes) seulement si ≥ 1 variante EU
       if (productHasEU) {
-        keptProductsEU++;
+        keptProductsEU++; keptProductIds.add(String(pid));
         try {
           const [pcats, ppr, psz] = await Promise.all([
-            fetchProductCategories(pid).catch(e => { console.warn(`product ${pid} categories failed:`, e.message); return []; }),
-            fetchProductPrices(pid).catch(e => { console.warn(`product ${pid} prices failed:`, e.message); return []; }),
-            fetchProductSizes(pid).catch(e => { console.warn(`product ${pid} sizes failed:`, e.message); return []; }),
+            fetchProductCategories(pid).catch(e => { warnings.push(`product ${pid} categories failed: ${e.message}`); return []; }),
+            fetchProductPrices(pid).catch(e => { warnings.push(`product ${pid} prices failed: ${e.message}`); return []; }),
+            fetchProductSizes(pid).catch(e => { warnings.push(`product ${pid} sizes failed: ${e.message}`); return []; }),
           ]);
           productCategories.push(...pcats);
           productPrices.push(...ppr);
           productSizes.push(...psz);
-        } catch {}
+        } catch (e) {
+          warnings.push(`product ${pid} meta failed: ${e?.message || e}`);
+        }
       }
 
       // variantes retenues EU : images + prices (+ availability déjà filtrée EU)
       for (const { vid, avs } of kept) {
         try {
           const [imgs, vprs] = await Promise.all([
-            fetchVariantImages(vid).catch(() => []),
-            fetchVariantPrices(vid).catch(() => []),
+            fetchVariantImages(vid).catch(e => { warnings.push(`variant ${vid} images failed: ${e.message}`); return []; }),
+            fetchVariantPrices(vid).catch(e => { warnings.push(`variant ${vid} prices failed: ${e.message}`); return []; }),
           ]);
           variantAvailability.push(...avs);
           variantImages.push(...imgs);
           variantPrices.push(...vprs);
-          keptVariantsEU++;
-        } catch {}
+          keptVariantsEU++; keptVariantIds.add(String(vid));
+        } catch (e) {
+          warnings.push(`variant ${vid} meta failed: ${e?.message || e}`);
+        }
         vCount++;
         if (vCount % LOG_EVERY === 0) {
           console.log(`...variants processed=${vCount}, keptEU=${keptVariantsEU}, minInterval=${(rate.minIntervalMs||0)}ms, conc=${targetConc}, active=${active}`);
@@ -352,19 +371,137 @@ async function fetchVariantPrices(vid) {
       }
     }
 
-    // Écritures
-    writeCsv(path.join(OUT_DIR, "product_categories.csv"), productCategories);
-    writeCsv(path.join(OUT_DIR, "product_images.csv"), variantImages);
-    writeCsv(path.join(OUT_DIR, "availability.csv"), variantAvailability);
-    writeCsv(path.join(OUT_DIR, "prices.csv"), variantPrices);
-    writeCsv(path.join(OUT_DIR, "product_prices.csv"), productPrices);
-    writeCsv(path.join(OUT_DIR, "sizes.csv"), productSizes);
+    // Écritures CSV
+    const files = {
+      categories: path.join(OUT_DIR, "categories.csv"),
+      countries: path.join(OUT_DIR, "countries.csv"),
+      product_categories: path.join(OUT_DIR, "product_categories.csv"),
+      product_prices: path.join(OUT_DIR, "product_prices.csv"),
+      sizes: path.join(OUT_DIR, "sizes.csv"),
+      availability: path.join(OUT_DIR, "availability.csv"),
+      variant_prices: path.join(OUT_DIR, "prices.csv"),
+      product_images: path.join(OUT_DIR, "product_images.csv"),
+    };
 
-    console.log(
-      "REST v2 done.",
-      `Products scanned=${pCount}, keptEU=${keptProductsEU}; Variants scanned=${vCount}, keptEU=${keptVariantsEU}.`,
-      `Final minInterval=${rate.minIntervalMs}ms, final concurrency=${targetConc}`
+    function countRows(arr) { return Array.isArray(arr) ? arr.length : 0; }
+
+    writeCsv(files.product_categories, productCategories);
+    writeCsv(files.product_images, variantImages);
+    writeCsv(files.availability, variantAvailability);
+    writeCsv(files.variant_prices, variantPrices);
+    writeCsv(files.product_prices, productPrices);
+    writeCsv(files.sizes, productSizes);
+
+    // ---------------- Contrôles de complétude ----------------
+    const endedAt = new Date().toISOString();
+
+    // Charger les compteurs de categories/countries écrits au début
+    const readCsvCount = (filePath) => {
+      try {
+        const txt = fs.readFileSync(filePath, "utf8");
+        const lines = txt.split(/\r?\n/).filter(Boolean);
+        return Math.max(0, lines.length - (lines.length > 0 ? 1 : 0)); // - header si présent
+      } catch { return 0; }
+    };
+
+    const counts = {
+      categories: readCsvCount(files.categories),
+      countries: readCsvCount(files.countries),
+      product_categories: countRows(productCategories),
+      product_prices: countRows(productPrices),
+      sizes: countRows(productSizes),
+      availability: countRows(variantAvailability),
+      variant_prices: countRows(variantPrices),
+      product_images: countRows(variantImages),
+      kept_products_eu: keptProductIds.size,
+      kept_variants_eu: keptVariantIds.size,
+      sizes_no_guide: sizesNoGuideCount,
+    };
+
+    // 1) Critiques : ces jeux doivent être non vides
+    if (counts.categories === 0) errors.push("categories.csv est vide");
+    if (counts.countries === 0) errors.push("countries.csv est vide");
+    if (counts.kept_products_eu === 0) errors.push("Aucun produit EU retenu");
+    if (counts.kept_variants_eu === 0) errors.push("Aucune variante EU retenue");
+    if (counts.availability === 0) errors.push("availability.csv est vide (EU)");
+
+    // 2) Cohérence : chaque variante EU doit avoir ≥1 dispo EU enregistrée
+    const availVariantIds = new Set(variantAvailability.map(r => String(r.variant_id ?? "")));
+    const missingAvail = [];
+    for (const vid of keptVariantIds) {
+      if (!availVariantIds.has(String(vid))) missingAvail.push(vid);
+    }
+    if (missingAvail.length > 0) {
+      errors.push(`Disponibilité manquante pour ${missingAvail.length} variantes EU`);
+    }
+
+    // 3) Non critique : images/prices peuvent être absents pour certaines variantes/prods
+    //    On l'indique en warning informatif
+    const imageVariantIds = new Set(variantImages.map(r => String(r.variant_id ?? "")));
+    const priceVariantIds = new Set(variantPrices.map(r => String(r.variant_id ?? "")));
+    const variantsWithoutImages = [];
+    const variantsWithoutPrices = [];
+    for (const vid of keptVariantIds) {
+      if (!imageVariantIds.has(vid)) variantsWithoutImages.push(vid);
+      if (!priceVariantIds.has(vid)) variantsWithoutPrices.push(vid);
+    }
+    if (variantsWithoutImages.length > 0) warnings.push(`${variantsWithoutImages.length} variantes EU sans images`);
+    if (variantsWithoutPrices.length > 0) warnings.push(`${variantsWithoutPrices.length} variantes EU sans prices`);
+
+    // Rapport
+    const report = {
+      startedAt, endedAt,
+      base_url: BASE_URL, eu_only: EU_ONLY,
+      page_limit_raw: RAW_LIMIT, page_limit_effective: LIMIT,
+      rate_min_interval_ms: rate.minIntervalMs,
+      concurrency_final: targetConc,
+      counts,
+      errors,
+      warnings,
+    };
+    const reportJson = path.join(OUT_DIR, "_rest_run_report.json");
+    const reportTxt = path.join(OUT_DIR, "_rest_run_report.txt");
+    fs.writeFileSync(reportJson, JSON.stringify(report, null, 2), "utf8");
+    fs.writeFileSync(
+      reportTxt,
+      [
+        `REST v2 report`,
+        `Started: ${startedAt}`,
+        `Ended:   ${endedAt}`,
+        `EU_ONLY: ${EU_ONLY}`,
+        `Limit:   raw=${RAW_LIMIT} effective=${LIMIT}`,
+        `Rate:    minInterval=${rate.minIntervalMs}ms, final concurrency=${targetConc}`,
+        ``,
+        `Counts:`,
+        `- categories.csv        : ${counts.categories}`,
+        `- countries.csv         : ${counts.countries}`,
+        `- product_categories.csv: ${counts.product_categories}`,
+        `- product_prices.csv    : ${counts.product_prices}`,
+        `- sizes.csv             : ${counts.sizes} (no guide: ${counts.sizes_no_guide})`,
+        `- availability.csv (EU) : ${counts.availability}`,
+        `- prices.csv (EU)       : ${counts.variant_prices}`,
+        `- product_images.csv    : ${counts.product_images}`,
+        `- kept products (EU)    : ${counts.kept_products_eu}`,
+        `- kept variants (EU)    : ${counts.kept_variants_eu}`,
+        ``,
+        `Errors (${errors.length}) :`,
+        ...(errors.length ? errors.map(e => `  - ${e}`) : ["  (none)"]),
+        `Warnings (${warnings.length}):`,
+        ...(warnings.length ? warnings.map(w => `  - ${w}`) : ["  (none)"]),
+        ``,
+      ].join("\n"),
+      "utf8"
     );
+
+    console.log(`\n=== RUN SUMMARY ===`);
+    console.log(fs.readFileSync(reportTxt, "utf8"));
+
+    if (STRICT && errors.length > 0) {
+      console.error("REST completed with critical errors — failing as STRICT=true");
+      process.exit(1);
+    }
+
+    console.log("REST v2 done (strict mode:", STRICT, ").");
   } catch (e) {
     console.error("REST failed:", e?.message || e);
     process.exit(1);

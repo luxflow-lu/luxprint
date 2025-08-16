@@ -1,31 +1,30 @@
 // REST (v2 only, EU-only par défaut)
-//
 // Génère :
-// - categories.csv              (GET /v2/catalog-categories)
-// - countries.csv               (GET /v2/countries)
-// - product_categories.csv      (GET /v2/catalog-products/{id}/catalog-categories)
-// - product_prices.csv          (GET /v2/catalog-products/{id}/prices)
-// - sizes.csv                   (GET /v2/catalog-products/{id}/sizes) [silence "No size guides"]
-// - product_images.csv          (GET /v2/catalog-variants/{vid}/images)   [EU-only variants]
-// - availability.csv            (GET /v2/catalog-variants/{vid}/availability) [EU-only entries]
-// - prices.csv                  (GET /v2/catalog-variants/{vid}/prices)   [EU-only variants]
-//
-// Peut tourner AVANT CORE. Concurrence contrôlée sur variantes.
-// Auth: PRINTFUL_TOKEN (Bearer)
+// - categories.csv
+// - countries.csv
+// - product_categories.csv
+// - product_prices.csv
+// - sizes.csv
+// - product_images.csv
+// - availability.csv  (EU-only)
+// - prices.csv        (EU-only)
+// Anti-429 : pause globale + concurrence dynamique (AIMD)
 
 import fs from "node:fs";
 import path from "node:path";
 
 const API_KEY = process.env.PRINTFUL_TOKEN;
-if (!API_KEY) {
-  console.error("Missing PRINTFUL_TOKEN in env.");
-  process.exit(1);
-}
+if (!API_KEY) { console.error("Missing PRINTFUL_TOKEN in env."); process.exit(1); }
 
 const BASE_URL = (process.env.BASE_URL || "https://api.printful.com").replace(/\/+$/, "");
-const LIMIT = Number.parseInt(process.env.PAGE_LIMIT || "200", 10);
-const CONCURRENCY = Number.parseInt(process.env.CONCURRENCY || "8", 10);
+const LIMIT = Number.parseInt(process.env.PAGE_LIMIT || "150", 10);
 const LOG_EVERY = Number.parseInt(process.env.LOG_EVERY || "200", 10);
+
+// Concurrence dynamique
+const INIT_CONC = Number.parseInt(process.env.CONCURRENCY || "8", 10);
+let targetConc = Math.max(2, INIT_CONC);  // cible dynamique
+const MIN_CONC = 2;
+const MAX_CONC = Math.max(INIT_CONC, 8);
 
 const EU_ONLY = (process.env.EU_ONLY ?? "true") === "true";
 const EU_COUNTRIES = (process.env.EU_COUNTRIES ??
@@ -35,59 +34,96 @@ const EU_COUNTRIES = (process.env.EU_COUNTRIES ??
 const OUT_DIR = path.resolve("data");
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
+// ---------- Concurrence & pause globale ----------
+let active = 0;
+let globalPauseUntil = 0;
+let successStreak = 0;
+
+function now() { return Date.now(); }
+function jitter(ms) { return Math.floor(ms * (0.85 + Math.random() * 0.3)); }
+
+async function acquireSlot() {
+  while (true) {
+    const waitMs = globalPauseUntil - now();
+    if (waitMs > 0) await sleep(waitMs);
+
+    if (active < targetConc) { active++; return; }
+    await sleep(25);
+  }
+}
+function releaseSlot() { active = Math.max(0, active - 1); }
+
+function reduceConcurrency() {
+  const old = targetConc;
+  targetConc = Math.max(MIN_CONC, Math.floor(targetConc / 2));
+  successStreak = 0;
+  if (targetConc < old) console.log(`[rate] decrease concurrency ${old} -> ${targetConc}`);
+}
+function maybeIncreaseConcurrency() {
+  // augmente doucement après une longue série de succès
+  if (successStreak >= 200 && targetConc < MAX_CONC) {
+    const old = targetConc;
+    targetConc = Math.min(MAX_CONC, targetConc + 1);
+    successStreak = 0;
+    console.log(`[rate] increase concurrency ${old} -> ${targetConc}`);
+  }
+}
+
 const headers = {
   "Authorization": `Bearer ${API_KEY}`,
-  "User-Agent": "printful-catalog-rest-v2/1.3",
+  "User-Agent": "printful-catalog-rest-v2/1.4",
   // "X-PF-Language": "en",
 };
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// ---------- utils ----------
-function isEUCountry(code) {
-  return !!code && EU_COUNTRIES.includes(String(code).toUpperCase());
-}
-function filterAvailabilityToEU(items) {
-  if (!EU_ONLY) return Array.isArray(items) ? items : (items ? [items] : []);
-  const arr = Array.isArray(items) ? items : (items ? [items] : []);
-  return arr.filter(it => {
-    if (isEUCountry(it?.country_code)) return true;
-    if (Array.isArray(it?.countries) && it.countries.some(isEUCountry)) return true;
-    if (Array.isArray(it?.country_codes) && it.country_codes.some(isEUCountry)) return true;
-    if (typeof it?.region === "string" && it.region.toUpperCase() === "EU") return true;
-    return false;
-  });
-}
-
-async function fetchJsonWithRetry(url, maxRetries = 8, backoff = 1000) {
+async function fetchJsonWithRetry(url, maxRetries = 8, baseBackoff = 1000) {
   for (let a = 0; a <= maxRetries; a++) {
+    await acquireSlot();
     try {
+      // Respecte une éventuelle pause globale
+      const waitMs = globalPauseUntil - now();
+      if (waitMs > 0) await sleep(waitMs);
+
       const res = await fetch(url, { headers });
       if (res.status === 429) {
+        // Retry-After ou backoff exponentiel + jitter, et baisse de la concurrence
         const ra = res.headers.get("retry-after");
-        const wait = ra ? Math.ceil(Number(ra) * 1000) : backoff * (2 ** a);
-        console.log(`429 received, waiting ${wait}ms`);
-        await sleep(wait);
-        continue;
+        let wait = ra ? Math.ceil(Number(ra) * 1000) : baseBackoff * (2 ** a);
+        wait = jitter(wait);
+        globalPauseUntil = now() + wait;
+        console.log(`[429] waiting ~${wait}ms (retry-after=${ra || "n/a"}), active=${active}`);
+        reduceConcurrency();
+        continue; // on relance l'essai (sans compter comme succès)
       }
       if (res.status >= 500) {
-        const wait = backoff * (2 ** a);
-        console.log(`5xx received, waiting ${wait}ms`);
-        await sleep(wait);
+        const wait = jitter(baseBackoff * (2 ** a));
+        globalPauseUntil = now() + wait;
+        console.log(`[5xx:${res.status}] waiting ~${wait}ms`);
         continue;
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status} - ${await res.text()}`);
-      return await res.json();
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error(`HTTP ${res.status} - ${txt}`);
+      }
+
+      const json = await res.json();
+      successStreak++;
+      maybeIncreaseConcurrency();
+      return json;
     } catch (e) {
       if (a === maxRetries) throw e;
-      const wait = backoff * (2 ** a);
-      console.log(`Retrying after error (${e?.message || e}) in ${wait}ms`);
-      await sleep(wait);
+      const wait = jitter(baseBackoff * (2 ** a));
+      console.log(`[error:${e?.message || e}] backing off ~${wait}ms`);
+      globalPauseUntil = now() + wait;
+    } finally {
+      releaseSlot();
     }
   }
   throw new Error("fetchJsonWithRetry exhausted");
 }
 
+// ---------- Helpers v2 ----------
 function parseItemsAndPaging(payload) {
   if (!payload) return { items: [], paging: null };
   if ("data" in payload) {
@@ -101,7 +137,6 @@ function parseItemsAndPaging(payload) {
   }
   return { items: [], paging: null };
 }
-
 async function pagedGET(pathname, limit = LIMIT) {
   let offset = 0, total = null;
   const all = [];
@@ -118,6 +153,22 @@ async function pagedGET(pathname, limit = LIMIT) {
   return all;
 }
 
+// ---------- EU helpers ----------
+function isEUCountry(code) {
+  return !!code && EU_COUNTRIES.includes(String(code).toUpperCase());
+}
+function filterAvailabilityToEU(items) {
+  const arr = Array.isArray(items) ? items : (items ? [items] : []);
+  return arr.filter(it => {
+    if (isEUCountry(it?.country_code)) return true;
+    if (Array.isArray(it?.countries) && it.countries.some(isEUCountry)) return true;
+    if (Array.isArray(it?.country_codes) && it.country_codes.some(isEUCountry)) return true;
+    if (typeof it?.region === "string" && it.region.toUpperCase() === "EU") return true;
+    return false;
+  });
+}
+
+// ---------- CSV ----------
 function writeCsv(filePath, rows) {
   const set = new Set();
   rows.forEach(r => Object.keys(r).forEach(k => set.add(k)));
@@ -137,21 +188,7 @@ function writeCsv(filePath, rows) {
   console.log(`Wrote ${filePath} — ${rows.length} rows`);
 }
 
-async function mapLimit(items, limit, iteratee) {
-  const results = new Array(items.length);
-  let i = 0;
-  const workers = Array(Math.min(limit, items.length)).fill(0).map(async () => {
-    while (true) {
-      const idx = i++;
-      if (idx >= items.length) break;
-      results[idx] = await iteratee(items[idx], idx);
-    }
-  });
-  await Promise.all(workers);
-  return results;
-}
-
-// ---------- top-level dumps ----------
+// ---------- Top-level dumps ----------
 async function dumpCategories() {
   try {
     const rows = await pagedGET("/v2/catalog-categories");
@@ -161,7 +198,6 @@ async function dumpCategories() {
     writeCsv(path.join(OUT_DIR, "categories.csv"), []);
   }
 }
-
 async function dumpCountries() {
   try {
     const rows = await pagedGET("/v2/countries");
@@ -172,14 +208,13 @@ async function dumpCountries() {
   }
 }
 
-// ---------- per product / per variant ----------
+// ---------- Per product / variant ----------
 async function listCatalogProducts() {
   return await pagedGET("/v2/catalog-products");
 }
 async function listVariantsForProduct(pid) {
   return await pagedGET(`/v2/catalog-products/${encodeURIComponent(pid)}/catalog-variants`);
 }
-
 async function fetchProductCategories(pid) {
   const json = await fetchJsonWithRetry(`${BASE_URL}/v2/catalog-products/${encodeURIComponent(pid)}/catalog-categories`);
   const { items } = parseItemsAndPaging(json);
@@ -210,7 +245,6 @@ async function fetchProductSizes(pid) {
     throw e;
   }
 }
-
 async function fetchVariantAvailability(vid) {
   const json = await fetchJsonWithRetry(`${BASE_URL}/v2/catalog-variants/${encodeURIComponent(vid)}/availability`);
   const { items } = parseItemsAndPaging(json);
@@ -227,10 +261,10 @@ async function fetchVariantPrices(vid) {
   return items.map(it => ({ ...(typeof it === "object" ? it : { value: it }), variant_id: vid }));
 }
 
-// ---------- main ----------
+// ---------- Main ----------
 (async function main() {
   try {
-    console.log(`REST v2 start — EU_ONLY=${EU_ONLY}, PAGE_LIMIT=${LIMIT}, CONCURRENCY=${CONCURRENCY}`);
+    console.log(`REST v2 start — EU_ONLY=${EU_ONLY}, PAGE_LIMIT=${LIMIT}, INIT_CONCURRENCY=${INIT_CONC}`);
 
     await dumpCategories();
     await dumpCountries();
@@ -245,16 +279,14 @@ async function fetchVariantPrices(vid) {
     const products = await listCatalogProducts();
     console.log(`Found ${products.length} catalog products`);
 
-    let pCount = 0;
-    let keptProductsEU = 0;
-    let vCount = 0;
-    let keptVariantsEU = 0;
+    let pCount = 0, keptProductsEU = 0;
+    let vCount = 0, keptVariantsEU = 0;
 
     for (const p of products) {
       const pid = p?.id ?? p?.product_id ?? p?.catalog_product_id;
       if (pid == null) continue;
 
-      // Liste des variantes (toutes) de ce produit
+      // 1) Variantes du produit
       let variants = [];
       try {
         variants = await listVariantsForProduct(pid);
@@ -262,29 +294,22 @@ async function fetchVariantPrices(vid) {
         console.warn(`product ${pid} variants failed:`, e.message || e);
       }
 
-      // On évalue d'abord l'EU pour les variantes (availability) avec concurrence
-      // => si EU_ONLY, on garde uniquement les variantes EU
-      const EU_checked = await mapLimit(variants, CONCURRENCY, async (v) => {
+      // 2) Vérifie EU via availability (déjà filtrée)
+      const checked = await Promise.all(variants.map(async (v) => {
         const vid = v?.id ?? v?.variant_id;
         if (vid == null) return null;
-
         let avs = [];
-        try {
-          avs = await fetchVariantAvailability(vid); // déjà filtré EU si EU_ONLY
-        } catch (e) {
-          // indispo / erreur => on considère non-EU si EU_ONLY
-          avs = [];
-        }
-
+        try { avs = await fetchVariantAvailability(vid); } catch { avs = []; }
         const isEU = EU_ONLY ? (avs.length > 0) : true;
         return { v, vid, avs, isEU };
-      });
+      }));
 
-      const keptVariantEntries = EU_checked.filter(x => x && x.isEU);
-      if (!EU_ONLY || keptVariantEntries.length > 0) {
-        // Ce produit est gardé (EU-only => au moins 1 variante EU)
+      const kept = checked.filter(x => x && x.isEU);
+      const productHasEU = (!EU_ONLY) || kept.length > 0;
+
+      // 3) Infos produit seulement si on garde le produit (EU)
+      if (productHasEU) {
         keptProductsEU++;
-        // 1) Infos produit (cats/prices/sizes)
         try {
           const [pcats, ppr, psz] = await Promise.all([
             fetchProductCategories(pid).catch(e => { console.warn(`product ${pid} categories failed:`, e.message); return []; }),
@@ -295,32 +320,29 @@ async function fetchVariantPrices(vid) {
           productPrices.push(...ppr);
           productSizes.push(...psz);
         } catch {}
-
-        // 2) Pour chaque variante EU gardée : images + prices
-        await mapLimit(keptVariantEntries, CONCURRENCY, async (entry) => {
-          const { vid, avs } = entry;
-          try {
-            const [imgs, vprs] = await Promise.all([
-              fetchVariantImages(vid).catch(() => []),
-              fetchVariantPrices(vid).catch(() => []),
-            ]);
-            // availability déjà filtrée EU
-            variantAvailability.push(...avs);
-            variantImages.push(...imgs);
-            variantPrices.push(...vprs);
-            keptVariantsEU++;
-          } catch {}
-          vCount++;
-          if (vCount % LOG_EVERY === 0) console.log(`...processed ${vCount} variants (${keptVariantsEU} kept EU)`);
-        });
-      } else {
-        // produit non EU => skip infos produit
-        vCount += variants.length;
       }
+
+      // 4) Pour chaque variante EU retenue, on récupère images & prices
+      await Promise.all(kept.map(async ({ vid, avs }) => {
+        try {
+          const [imgs, vprs] = await Promise.all([
+            fetchVariantImages(vid).catch(() => []),
+            fetchVariantPrices(vid).catch(() => []),
+          ]);
+          variantAvailability.push(...avs);      // déjà filtrée EU
+          variantImages.push(...imgs);
+          variantPrices.push(...vprs);
+          keptVariantsEU++;
+        } catch {}
+        vCount++;
+        if (vCount % LOG_EVERY === 0) {
+          console.log(`...variants processed=${vCount}, keptEU=${keptVariantsEU}, concurrency=${targetConc}, active=${active}`);
+        }
+      }));
 
       pCount++;
       if (pCount % Math.max(1, Math.floor(LOG_EVERY / 5)) === 0) {
-        console.log(`...processed ${pCount} products (${keptProductsEU} kept EU)`);
+        console.log(`...products processed=${pCount}, keptEU=${keptProductsEU}, concurrency=${targetConc}, active=${active}`);
       }
     }
 
@@ -332,8 +354,10 @@ async function fetchVariantPrices(vid) {
     writeCsv(path.join(OUT_DIR, "product_prices.csv"), productPrices);   // par produit  (EU)
     writeCsv(path.join(OUT_DIR, "sizes.csv"), productSizes);             // par produit  (EU)
 
-    console.log("REST v2 done.",
-      `Products scanned=${pCount}, keptEU=${keptProductsEU}; Variants scanned=${vCount}, keptEU=${keptVariantsEU}`
+    console.log(
+      "REST v2 done.",
+      `Products scanned=${pCount}, keptEU=${keptProductsEU}; Variants scanned=${vCount}, keptEU=${keptVariantsEU}.`,
+      `Final concurrency=${targetConc}`
     );
   } catch (e) {
     console.error("REST failed:", e?.message || e);

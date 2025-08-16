@@ -1,14 +1,6 @@
-// REST (v2 only, EU-only par défaut)
-// Génère :
-// - categories.csv
-// - countries.csv
-// - product_categories.csv
-// - product_prices.csv
-// - sizes.csv
-// - product_images.csv
-// - availability.csv  (EU-only)
-// - prices.csv        (EU-only)
-// Anti-429 : pause globale + concurrence dynamique (AIMD)
+// REST (v2 only, EU-only par défaut) — anti-429 adaptatif, no-retry sur 400
+// Génère : categories.csv, countries.csv, product_categories.csv, product_prices.csv,
+// sizes.csv, product_images.csv, availability.csv (EU), prices.csv (EU)
 
 import fs from "node:fs";
 import path from "node:path";
@@ -16,16 +8,12 @@ import path from "node:path";
 const API_KEY = process.env.PRINTFUL_TOKEN;
 if (!API_KEY) { console.error("Missing PRINTFUL_TOKEN in env."); process.exit(1); }
 
-const BASE_URL = (process.env.BASE_URL || "https://api.printful.com").replace(/\/+$/, "");
-const LIMIT = Number.parseInt(process.env.PAGE_LIMIT || "150", 10);
+const RAW_LIMIT = Number.parseInt(process.env.PAGE_LIMIT || "100", 10);
+const LIMIT = Math.min(Math.max(isNaN(RAW_LIMIT) ? 100 : RAW_LIMIT, 1), 100); // <- cap 1..100
 const LOG_EVERY = Number.parseInt(process.env.LOG_EVERY || "200", 10);
-
-// Concurrence dynamique
 const INIT_CONC = Number.parseInt(process.env.CONCURRENCY || "8", 10);
-let targetConc = Math.max(2, INIT_CONC);  // cible dynamique
-const MIN_CONC = 2;
-const MAX_CONC = Math.max(INIT_CONC, 8);
 
+const BASE_URL = (process.env.BASE_URL || "https://api.printful.com").replace(/\/+$/, "");
 const EU_ONLY = (process.env.EU_ONLY ?? "true") === "true";
 const EU_COUNTRIES = (process.env.EU_COUNTRIES ??
   "AT,BE,BG,HR,CY,CZ,DK,EE,FI,FR,DE,GR,HU,IE,IT,LV,LT,LU,MT,NL,PL,PT,RO,SK,SI,ES,SE,GB,NO,CH,IS,LI"
@@ -35,66 +23,58 @@ const OUT_DIR = path.resolve("data");
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
 // ---------- Concurrence & pause globale ----------
+let targetConc = Math.max(2, INIT_CONC);
+const MIN_CONC = 2;
+const MAX_CONC = Math.max(INIT_CONC, 8);
 let active = 0;
 let globalPauseUntil = 0;
 let successStreak = 0;
 
-function now() { return Date.now(); }
-function jitter(ms) { return Math.floor(ms * (0.85 + Math.random() * 0.3)); }
+const headers = {
+  "Authorization": `Bearer ${API_KEY}`,
+  "User-Agent": "printful-catalog-rest-v2/1.5",
+};
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const now = () => Date.now();
+const jitter = (ms) => Math.floor(ms * (0.85 + Math.random() * 0.3));
 
 async function acquireSlot() {
   while (true) {
     const waitMs = globalPauseUntil - now();
     if (waitMs > 0) await sleep(waitMs);
-
     if (active < targetConc) { active++; return; }
     await sleep(25);
   }
 }
 function releaseSlot() { active = Math.max(0, active - 1); }
-
 function reduceConcurrency() {
-  const old = targetConc;
-  targetConc = Math.max(MIN_CONC, Math.floor(targetConc / 2));
-  successStreak = 0;
+  const old = targetConc; targetConc = Math.max(MIN_CONC, Math.floor(targetConc / 2)); successStreak = 0;
   if (targetConc < old) console.log(`[rate] decrease concurrency ${old} -> ${targetConc}`);
 }
 function maybeIncreaseConcurrency() {
-  // augmente doucement après une longue série de succès
   if (successStreak >= 200 && targetConc < MAX_CONC) {
-    const old = targetConc;
-    targetConc = Math.min(MAX_CONC, targetConc + 1);
-    successStreak = 0;
+    const old = targetConc; targetConc = Math.min(MAX_CONC, targetConc + 1); successStreak = 0;
     console.log(`[rate] increase concurrency ${old} -> ${targetConc}`);
   }
 }
-
-const headers = {
-  "Authorization": `Bearer ${API_KEY}`,
-  "User-Agent": "printful-catalog-rest-v2/1.4",
-  // "X-PF-Language": "en",
-};
-
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 async function fetchJsonWithRetry(url, maxRetries = 8, baseBackoff = 1000) {
   for (let a = 0; a <= maxRetries; a++) {
     await acquireSlot();
     try {
-      // Respecte une éventuelle pause globale
       const waitMs = globalPauseUntil - now();
       if (waitMs > 0) await sleep(waitMs);
 
       const res = await fetch(url, { headers });
       if (res.status === 429) {
-        // Retry-After ou backoff exponentiel + jitter, et baisse de la concurrence
         const ra = res.headers.get("retry-after");
         let wait = ra ? Math.ceil(Number(ra) * 1000) : baseBackoff * (2 ** a);
         wait = jitter(wait);
         globalPauseUntil = now() + wait;
-        console.log(`[429] waiting ~${wait}ms (retry-after=${ra || "n/a"}), active=${active}`);
+        console.log(`[429] waiting ~${wait}ms (retry-after=${ra || "n/a"})`);
         reduceConcurrency();
-        continue; // on relance l'essai (sans compter comme succès)
+        continue;
       }
       if (res.status >= 500) {
         const wait = jitter(baseBackoff * (2 ** a));
@@ -104,14 +84,17 @@ async function fetchJsonWithRetry(url, maxRetries = 8, baseBackoff = 1000) {
       }
       if (!res.ok) {
         const txt = await res.text();
-        throw new Error(`HTTP ${res.status} - ${txt}`);
+        const err = new Error(`HTTP ${res.status} - ${txt}`);
+        // ne pas réessayer les 4xx (sauf 429)
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) err._noRetry = true;
+        throw err;
       }
 
       const json = await res.json();
-      successStreak++;
-      maybeIncreaseConcurrency();
+      successStreak++; maybeIncreaseConcurrency();
       return json;
     } catch (e) {
+      if (e?._noRetry) throw e;
       if (a === maxRetries) throw e;
       const wait = jitter(baseBackoff * (2 ** a));
       console.log(`[error:${e?.message || e}] backing off ~${wait}ms`);
@@ -123,7 +106,7 @@ async function fetchJsonWithRetry(url, maxRetries = 8, baseBackoff = 1000) {
   throw new Error("fetchJsonWithRetry exhausted");
 }
 
-// ---------- Helpers v2 ----------
+// ---------- v2 helpers ----------
 function parseItemsAndPaging(payload) {
   if (!payload) return { items: [], paging: null };
   if ("data" in payload) {
@@ -138,7 +121,7 @@ function parseItemsAndPaging(payload) {
   return { items: [], paging: null };
 }
 async function pagedGET(pathname, limit = LIMIT) {
-  let offset = 0, total = null;
+  let offset = 0;
   const all = [];
   while (true) {
     const url = `${BASE_URL}${pathname}?limit=${limit}&offset=${offset}`;
@@ -188,10 +171,10 @@ function writeCsv(filePath, rows) {
   console.log(`Wrote ${filePath} — ${rows.length} rows`);
 }
 
-// ---------- Top-level dumps ----------
+// ---------- top-level dumps ----------
 async function dumpCategories() {
   try {
-    const rows = await pagedGET("/v2/catalog-categories");
+    const rows = await pagedGET("/v2/catalog-categories", LIMIT);
     writeCsv(path.join(OUT_DIR, "categories.csv"), rows);
   } catch (e) {
     console.warn("Warn: catalog-categories failed — writing empty CSV.", e.message || e);
@@ -200,7 +183,7 @@ async function dumpCategories() {
 }
 async function dumpCountries() {
   try {
-    const rows = await pagedGET("/v2/countries");
+    const rows = await pagedGET("/v2/countries", LIMIT);
     writeCsv(path.join(OUT_DIR, "countries.csv"), rows);
   } catch (e) {
     console.warn("Warn: countries failed — writing empty CSV.", e.message || e);
@@ -208,12 +191,12 @@ async function dumpCountries() {
   }
 }
 
-// ---------- Per product / variant ----------
+// ---------- per product / variant ----------
 async function listCatalogProducts() {
-  return await pagedGET("/v2/catalog-products");
+  return await pagedGET("/v2/catalog-products", LIMIT);
 }
 async function listVariantsForProduct(pid) {
-  return await pagedGET(`/v2/catalog-products/${encodeURIComponent(pid)}/catalog-variants`);
+  return await pagedGET(`/v2/catalog-products/${encodeURIComponent(pid)}/catalog-variants`, LIMIT);
 }
 async function fetchProductCategories(pid) {
   const json = await fetchJsonWithRetry(`${BASE_URL}/v2/catalog-products/${encodeURIComponent(pid)}/catalog-categories`);
@@ -261,10 +244,10 @@ async function fetchVariantPrices(vid) {
   return items.map(it => ({ ...(typeof it === "object" ? it : { value: it }), variant_id: vid }));
 }
 
-// ---------- Main ----------
+// ---------- main ----------
 (async function main() {
   try {
-    console.log(`REST v2 start — EU_ONLY=${EU_ONLY}, PAGE_LIMIT=${LIMIT}, INIT_CONCURRENCY=${INIT_CONC}`);
+    console.log(`REST v2 start — EU_ONLY=${EU_ONLY}, PAGE_LIMIT=${LIMIT} (raw=${RAW_LIMIT}), INIT_CONCURRENCY=${INIT_CONC}`);
 
     await dumpCategories();
     await dumpCountries();
@@ -286,15 +269,12 @@ async function fetchVariantPrices(vid) {
       const pid = p?.id ?? p?.product_id ?? p?.catalog_product_id;
       if (pid == null) continue;
 
-      // 1) Variantes du produit
+      // Variantes du produit
       let variants = [];
-      try {
-        variants = await listVariantsForProduct(pid);
-      } catch (e) {
-        console.warn(`product ${pid} variants failed:`, e.message || e);
-      }
+      try { variants = await listVariantsForProduct(pid); }
+      catch (e) { console.warn(`product ${pid} variants failed:`, e.message || e); }
 
-      // 2) Vérifie EU via availability (déjà filtrée)
+      // Vérifie EU via availability (déjà filtrée)
       const checked = await Promise.all(variants.map(async (v) => {
         const vid = v?.id ?? v?.variant_id;
         if (vid == null) return null;
@@ -307,60 +287,9 @@ async function fetchVariantPrices(vid) {
       const kept = checked.filter(x => x && x.isEU);
       const productHasEU = (!EU_ONLY) || kept.length > 0;
 
-      // 3) Infos produit seulement si on garde le produit (EU)
       if (productHasEU) {
         keptProductsEU++;
         try {
           const [pcats, ppr, psz] = await Promise.all([
             fetchProductCategories(pid).catch(e => { console.warn(`product ${pid} categories failed:`, e.message); return []; }),
-            fetchProductPrices(pid).catch(e => { console.warn(`product ${pid} prices failed:`, e.message); return []; }),
-            fetchProductSizes(pid).catch(e => { console.warn(`product ${pid} sizes failed:`, e.message); return []; }),
-          ]);
-          productCategories.push(...pcats);
-          productPrices.push(...ppr);
-          productSizes.push(...psz);
-        } catch {}
-      }
-
-      // 4) Pour chaque variante EU retenue, on récupère images & prices
-      await Promise.all(kept.map(async ({ vid, avs }) => {
-        try {
-          const [imgs, vprs] = await Promise.all([
-            fetchVariantImages(vid).catch(() => []),
-            fetchVariantPrices(vid).catch(() => []),
-          ]);
-          variantAvailability.push(...avs);      // déjà filtrée EU
-          variantImages.push(...imgs);
-          variantPrices.push(...vprs);
-          keptVariantsEU++;
-        } catch {}
-        vCount++;
-        if (vCount % LOG_EVERY === 0) {
-          console.log(`...variants processed=${vCount}, keptEU=${keptVariantsEU}, concurrency=${targetConc}, active=${active}`);
-        }
-      }));
-
-      pCount++;
-      if (pCount % Math.max(1, Math.floor(LOG_EVERY / 5)) === 0) {
-        console.log(`...products processed=${pCount}, keptEU=${keptProductsEU}, concurrency=${targetConc}, active=${active}`);
-      }
-    }
-
-    // Écritures
-    writeCsv(path.join(OUT_DIR, "product_categories.csv"), productCategories);
-    writeCsv(path.join(OUT_DIR, "product_images.csv"), variantImages);
-    writeCsv(path.join(OUT_DIR, "availability.csv"), variantAvailability);
-    writeCsv(path.join(OUT_DIR, "prices.csv"), variantPrices);           // par variante (EU)
-    writeCsv(path.join(OUT_DIR, "product_prices.csv"), productPrices);   // par produit  (EU)
-    writeCsv(path.join(OUT_DIR, "sizes.csv"), productSizes);             // par produit  (EU)
-
-    console.log(
-      "REST v2 done.",
-      `Products scanned=${pCount}, keptEU=${keptProductsEU}; Variants scanned=${vCount}, keptEU=${keptVariantsEU}.`,
-      `Final concurrency=${targetConc}`
-    );
-  } catch (e) {
-    console.error("REST failed:", e?.message || e);
-    process.exit(1);
-  }
-})();
+            fetchProductPrices(pid).catch(e => { console.warn(`product ${pid} prices failed:`, e.mes

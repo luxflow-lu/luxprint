@@ -1,43 +1,50 @@
-name: Printful Catalog Split Run
+name: Printful Catalog Split Run (v2, EU-only)
 
 on:
   workflow_dispatch:
     inputs:
       part:
-        description: "Choisir la partie à lancer"
+        description: "Quelle partie lancer"
         type: choice
         required: true
         default: rest
         options: [rest, core, both]
       page_limit:
-        description: "Limite par page (défaut 100)"
+        description: "Taille de page API (défaut 200)"
         required: false
-        default: "100"
-      rest_endpoints_csv:
-        description: >
-          Endpoints REST à paginer (hors products/variants), séparés par des virgules.
-          Laisse vide pour utiliser la grosse liste par défaut.
+        default: "200"
+      concurrency:
+        description: "Concurrence (variants) – 6..12 recommandé"
         required: false
-        default: ""
+        default: "8"
+      eu_only:
+        description: "Filtrer EU uniquement ?"
+        type: choice
+        options: ["true", "false"]
+        required: false
+        default: "true"
 
 env:
   BASE_URL: "https://api.printful.com"
 
 jobs:
   rest:
-    name: REST (toutes les collections catalogue hors products/variants) + images & availability
+    name: REST (EU-only) — cats, countries, product mappings, images, availability, prices, sizes
     if: ${{ inputs.part == 'rest' || inputs.part == 'both' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run REST script (paginated)
+      - name: Run REST script
         run: node scripts/rest/run_rest.mjs
         env:
           PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}
           PAGE_LIMIT: ${{ inputs.page_limit }}
           BASE_URL: ${{ env.BASE_URL }}
-          REST_ENDPOINTS_CSV: ${{ inputs.rest_endpoints_csv }}
+          CONCURRENCY: ${{ inputs.concurrency }}
+          LOG_EVERY: "200"
+          EU_ONLY: ${{ inputs.eu_only }}
+          EU_COUNTRIES: "AT,BE,BG,HR,CY,CZ,DK,EE,FI,FR,DE,GR,HU,IE,IT,LV,LT,LU,MT,NL,PL,PT,RO,SK,SI,ES,SE,GB,NO,CH,IS,LI"
 
       - name: Upload CSV artifacts (REST)
         uses: actions/upload-artifact@v4
@@ -47,18 +54,21 @@ jobs:
           if-no-files-found: warn
 
   core:
-    name: CORE (products, variants)
+    name: CORE (EU-only) — products, variants
     if: ${{ inputs.part == 'core' || inputs.part == 'both' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run CORE script (paginated + checkpoint)
+      - name: Run CORE script
         run: node scripts/core/run_core.mjs
         env:
           PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}
           PAGE_LIMIT: ${{ inputs.page_limit }}
           BASE_URL: ${{ env.BASE_URL }}
+          # tu peux mettre "false" pour récupérer le core complet (plus rapide)
+          EU_ONLY: ${{ inputs.eu_only }}
+          LOG_EVERY: "200"
 
       - name: Upload CSV artifacts (CORE)
         uses: actions/upload-artifact@v4

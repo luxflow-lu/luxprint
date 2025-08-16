@@ -10,9 +10,9 @@ on:
         default: rest
         options: [rest, core, both]
       page_limit:
-        description: "Taille de page API (100–200 recommandé)"
+        description: "Taille de page API (1–100, défaut 100)"
         required: false
-        default: "150"
+        default: "100"
       concurrency:
         description: "Concurrence initiale (variants) – 4..12"
         required: false

@@ -9,7 +9,7 @@ const API_KEY = process.env.PRINTFUL_TOKEN;
 if (!API_KEY) { console.error("Missing PRINTFUL_TOKEN in env."); process.exit(1); }
 
 const RAW_LIMIT = Number.parseInt(process.env.PAGE_LIMIT || "100", 10);
-const LIMIT = Math.min(Math.max(isNaN(RAW_LIMIT) ? 100 : RAW_LIMIT, 1), 100); // <- cap 1..100
+const LIMIT = Math.min(Math.max(isNaN(RAW_LIMIT) ? 100 : RAW_LIMIT, 1), 100); // cap 1..100
 const LOG_EVERY = Number.parseInt(process.env.LOG_EVERY || "200", 10);
 const INIT_CONC = Number.parseInt(process.env.CONCURRENCY || "8", 10);
 
@@ -85,8 +85,7 @@ async function fetchJsonWithRetry(url, maxRetries = 8, baseBackoff = 1000) {
       if (!res.ok) {
         const txt = await res.text();
         const err = new Error(`HTTP ${res.status} - ${txt}`);
-        // ne pas réessayer les 4xx (sauf 429)
-        if (res.status >= 400 && res.status < 500 && res.status !== 429) err._noRetry = true;
+        if (res.status >= 400 && res.status < 500 && res.status !== 429) err._noRetry = true; // no-retry sur 4xx
         throw err;
       }
 
@@ -287,9 +286,60 @@ async function fetchVariantPrices(vid) {
       const kept = checked.filter(x => x && x.isEU);
       const productHasEU = (!EU_ONLY) || kept.length > 0;
 
+      // Infos produit (cats/prices/sizes) seulement si au moins 1 variante EU
       if (productHasEU) {
         keptProductsEU++;
         try {
           const [pcats, ppr, psz] = await Promise.all([
             fetchProductCategories(pid).catch(e => { console.warn(`product ${pid} categories failed:`, e.message); return []; }),
-            fetchProductPrices(pid).catch(e => { console.warn(`product ${pid} prices failed:`, e.mes
+            fetchProductPrices(pid).catch(e => { console.warn(`product ${pid} prices failed:`, e.message); return []; }),
+            fetchProductSizes(pid).catch(e => { console.warn(`product ${pid} sizes failed:`, e.message); return []; }),
+          ]);
+          productCategories.push(...pcats);
+          productPrices.push(...ppr);
+          productSizes.push(...psz);
+        } catch {}
+      }
+
+      // variantes retenues EU : images + prices (+ availability déjà filtrée EU)
+      await Promise.all(kept.map(async ({ vid, avs }) => {
+        try {
+          const [imgs, vprs] = await Promise.all([
+            fetchVariantImages(vid).catch(() => []),
+            fetchVariantPrices(vid).catch(() => []),
+          ]);
+          variantAvailability.push(...avs);
+          variantImages.push(...imgs);
+          variantPrices.push(...vprs);
+          keptVariantsEU++;
+        } catch {}
+        vCount++;
+        if (vCount % LOG_EVERY === 0) {
+          console.log(`...variants processed=${vCount}, keptEU=${keptVariantsEU}, concurrency=${targetConc}, active=${active}`);
+        }
+      }));
+
+      pCount++;
+      if (pCount % Math.max(1, Math.floor(LOG_EVERY / 5)) === 0) {
+        console.log(`...products processed=${pCount}, keptEU=${keptProductsEU}, concurrency=${targetConc}, active=${active}`);
+      }
+    }
+
+    // Écritures
+    writeCsv(path.join(OUT_DIR, "product_categories.csv"), productCategories);
+    writeCsv(path.join(OUT_DIR, "product_images.csv"), variantImages);
+    writeCsv(path.join(OUT_DIR, "availability.csv"), variantAvailability);
+    writeCsv(path.join(OUT_DIR, "prices.csv"), variantPrices);
+    writeCsv(path.join(OUT_DIR, "product_prices.csv"), productPrices);
+    writeCsv(path.join(OUT_DIR, "sizes.csv"), productSizes);
+
+    console.log(
+      "REST v2 done.",
+      `Products scanned=${pCount}, keptEU=${keptProductsEU}; Variants scanned=${vCount}, keptEU=${keptVariantsEU}.`,
+      `Final concurrency=${targetConc}`
+    );
+  } catch (e) {
+    console.error("REST failed:", e?.message || e);
+    process.exit(1);
+  }
+})();

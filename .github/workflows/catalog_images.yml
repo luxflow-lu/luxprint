@@ -1,0 +1,45 @@
+name: Catalog images (placements)
+
+on:
+  workflow_dispatch:
+    inputs:
+      INIT_CONCURRENCY:
+        description: "Concurrence initiale (1-8)"
+        default: "6"
+        required: true
+      PAGE_LIMIT:
+        description: "Taille de page pour la liste produits (1-100)"
+        default: "100"
+        required: true
+      STRICT:
+        description: "Echec si 0 lignes"
+        default: "true"
+        required: true
+
+jobs:
+  pull-images:
+    runs-on: ubuntu-latest
+    env:
+      BASE_URL: https://api.printful.com
+      PAGE_LIMIT: ${{ github.event.inputs.PAGE_LIMIT }}
+      INIT_CONCURRENCY: ${{ github.event.inputs.INIT_CONCURRENCY }}
+      STRICT: ${{ github.event.inputs.STRICT }}
+      PRINTFUL_TOKEN: ${{ secrets.PRINTFUL_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run extractor
+        run: node scripts/images/run_images.mjs
+
+      - name: Upload CSV
+        uses: actions/upload-artifact@v4
+        with:
+          name: product_images_by_placement
+          path: data/product_images_by_placement.csv
